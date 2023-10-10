@@ -1,9 +1,12 @@
 use futures::{stream::FuturesUnordered, Future, Stream, StreamExt};
 use std::{
     pin::Pin,
+    sync::atomic::{AtomicUsize, Ordering},
+    sync::Arc,
     task::{Context, Poll, Waker},
 };
 
+#[derive(Default, Debug)]
 /// A wrapper around `FuturesUnordered` that doesn't return `None` when it's empty.
 pub struct MaybePendingFutures<Fut> {
     futs: FuturesUnordered<Fut>,
@@ -29,6 +32,10 @@ impl<Fut> MaybePendingFutures<Fut> {
     pub fn is_empty(&self) -> bool {
         self.futs.is_empty()
     }
+
+    pub fn len(&self) -> usize {
+        self.futs.len()
+    }
 }
 
 impl<Fut: Future> Stream for MaybePendingFutures<Fut> {
@@ -41,5 +48,22 @@ impl<Fut: Future> Stream for MaybePendingFutures<Fut> {
         }
 
         self.futs.poll_next_unpin(cx)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ReconnectCounter(Arc<AtomicUsize>);
+
+impl ReconnectCounter {
+    pub fn new() -> Self {
+        Self(Arc::new(AtomicUsize::new(0)))
+    }
+
+    pub fn get(&self) -> usize {
+        self.0.load(Ordering::SeqCst)
+    }
+
+    pub fn inc(&self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
     }
 }

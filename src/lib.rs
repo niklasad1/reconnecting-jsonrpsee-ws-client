@@ -1,33 +1,52 @@
+//! Wrapper crate over the jsonrpsee ws client
+//! which automatically reconnects under the hood
+//! without that the user has to restart it manually
+//! by re-transmitting pending calls and re-establish subscriptions
+//! that normally be closed on disconnect.
+//!
+//! The tricky part is subscription which may loose a few notifications
+//! when re-connecting where it's not possible to know which ones.
+//!
+//! Lost subscription notifications may be very important to know in some scenarios where
+//! this crate is not recommended.
+//!
+//! # Examples
+//!
+//! ```no run
+//! use reconnecting_jsonrpsee_ws_client::{ReconnectingWsClient, ExponentialBackoff};
+//!
+//! // Connect to a remote node a retry with exponential backoff.
+//!
+//! let client = ReconnectingWsClient::new("ws://example.com", ExponentialBackoff::from_millis(10)).await.unwrap();
+//! let mut sub = client.subscribe("subscribe_lo".to_string(), rpc_params![], "unsubscribe_lo".to_string()).await.unwrap();
+//! let msg = sub.recv().await.unwrap();
+//!
+//! ```
+
 pub mod utils;
 
-use futures::StreamExt;
+use futures::{future::BoxFuture, FutureExt, StreamExt};
 use jsonrpsee::{
     core::client::{ClientT, Subscription},
     core::Error as RpcError,
     core::{client::SubscriptionClientT, params::ArrayParams},
     ws_client::{WsClient, WsClientBuilder},
 };
-use std::{
-    collections::HashMap,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
-    time::Duration,
-};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::{
     mpsc::{self, UnboundedReceiver, UnboundedSender},
     oneshot,
 };
 pub use tokio_retry::strategy::*;
 use tokio_retry::Retry;
-use utils::MaybePendingFutures;
+use utils::{MaybePendingFutures, ReconnectCounter};
 
 /// JSON-RPC client that reconnects automatically and may loose
 /// subscription notifications when it reconnects.
 #[derive(Clone)]
 pub struct ReconnectingWsClient {
     tx: mpsc::UnboundedSender<Op>,
+    reconnect_cnt: ReconnectCounter,
 }
 
 impl ReconnectingWsClient {
@@ -47,7 +66,7 @@ impl ReconnectingWsClient {
         let rp = rx
             .await
             .map_err(|_| RpcError::Custom("Client is dropped".to_string()))?;
-        tracing::trace!("call response: {:?}", rp);
+        tracing::trace!("RPC response: {:?}", rp);
         rp
     }
 
@@ -69,8 +88,11 @@ impl ReconnectingWsClient {
         let rp = rx
             .await
             .map_err(|_| RpcError::Custom("Client is dropped".to_string()))?;
-        tracing::trace!("sub: {:?}", rp);
         rp
+    }
+
+    pub fn retry_count(&self) -> usize {
+        self.reconnect_cnt.get()
     }
 }
 
@@ -81,10 +103,17 @@ impl ReconnectingWsClient {
     {
         let (tx, rx) = mpsc::unbounded_channel();
         let client = Retry::spawn(retry_policy.clone(), || ws_client(&url)).await?;
+        let reconnect_cnt = ReconnectCounter::new();
 
-        tokio::spawn(background_task(client, rx, retry_policy, url));
+        tokio::spawn(background_task(
+            client,
+            rx,
+            retry_policy,
+            url,
+            reconnect_cnt.clone(),
+        ));
 
-        Ok(Self { tx })
+        Ok(Self { tx, reconnect_cnt })
     }
 }
 
@@ -128,7 +157,7 @@ async fn dispatch_call(
     client: Arc<WsClient>,
     op: Op,
     id: usize,
-    client_restart: Arc<AtomicUsize>,
+    reconnect_cnt: ReconnectCounter,
     sub_closed: mpsc::UnboundedSender<usize>,
 ) -> Result<Option<(usize, RetrySubscription)>, Closed> {
     match op {
@@ -179,7 +208,7 @@ async fn dispatch_call(
                     tokio::spawn(subscription_handler(
                         tx.clone(),
                         sub,
-                        client_restart,
+                        reconnect_cnt,
                         sub_closed,
                         id,
                     ));
@@ -201,7 +230,7 @@ async fn dispatch_call(
                         unsubscribe_method,
                         send_back,
                     },
-                    id: id,
+                    id,
                 }),
                 Err(e) => {
                     let _ = send_back.send(Err(e));
@@ -216,19 +245,31 @@ async fn dispatch_call(
 async fn subscription_handler(
     tx: UnboundedSender<Result<serde_json::Value, RpcError>>,
     mut sub: Subscription<serde_json::Value>,
-    client_restart: Arc<AtomicUsize>,
+    reconnect_cnt: ReconnectCounter,
     sub_closed: mpsc::UnboundedSender<usize>,
     id: usize,
 ) {
-    let restart_cnt_before = client_restart.load(std::sync::atomic::Ordering::SeqCst);
+    let restart_cnt_before = reconnect_cnt.get();
 
-    while let Some(res) = sub.next().await {
-        let _ = tx.send(res);
-    }
+    let sub_dropped = loop {
+        tokio::select! {
+            next_msg = sub.next() => {
+                let Some(notif) = next_msg else {
+                    break false;
+                };
 
-    let restart_cnt_after = client_restart.load(std::sync::atomic::Ordering::SeqCst);
+                if tx.send(notif).is_err() {
+                    break true;
+                }
+            }
+            _ = sub_closed.closed() => break true,
+        }
+    };
 
-    if restart_cnt_before != restart_cnt_after {
+    // The subscription was dropped by the user or closed by some reason.
+    //
+    // Thus, the subscription should be removed.
+    if sub_dropped || restart_cnt_before != reconnect_cnt.get() {
         let _ = sub_closed.send(id);
     }
 }
@@ -238,6 +279,7 @@ async fn background_task<P>(
     mut rx: UnboundedReceiver<Op>,
     retry_policy: P,
     url: String,
+    reconnect_cnt: ReconnectCounter,
 ) where
     P: Iterator<Item = Duration> + Send + 'static + Clone,
 {
@@ -245,10 +287,17 @@ async fn background_task<P>(
     let mut pending_calls = MaybePendingFutures::new();
     let mut open_subscriptions = HashMap::new();
     let mut id = 0;
-    let client_restart = Arc::new(AtomicUsize::new(0));
 
     loop {
+        tracing::trace!(
+            "pending_calls={} open_subscriptions={}, client_restarts={}",
+            pending_calls.len(),
+            open_subscriptions.len(),
+            reconnect_cnt.get(),
+        );
+
         tokio::select! {
+
             // An incoming JSON-RPC call to dispatch.
             next_message = rx.recv() => {
                 tracing::trace!("next_message: {:?}", next_message);
@@ -256,7 +305,7 @@ async fn background_task<P>(
                 match next_message {
                     None => break,
                     Some(op) => {
-                        pending_calls.push(dispatch_call(client.clone(), op, id, client_restart.clone(), sub_tx.clone()));
+                        pending_calls.push(dispatch_call(client.clone(), op, id, reconnect_cnt.clone(), sub_tx.clone()).boxed());
                     }
                 };
             }
@@ -271,77 +320,27 @@ async fn background_task<P>(
                     }
                     // The connection was closed, re-connect and try to send all messages again.
                     Some(Err(Closed { op, id })) => {
-                        tracing::info!("Connection closed; time to reconnect");
-
-                        let mut dispatch = vec![(id, op)];
-
-                        // All futures should return now because the connection has been terminated.
-                        while !pending_calls.is_empty() {
-                            match pending_calls.next().await {
-                                Some(Ok(_)) | None => {}
-                                Some(Err(Closed { op, id })) => {
-                                    dispatch.push((id, op));
-                                }
-                            };
-                        }
-
-                        client_restart.fetch_add(1, Ordering::SeqCst);
-                        let client = Retry::spawn(retry_policy.clone(), || ws_client(&url)).await.unwrap();
-
-                        for (id, op) in dispatch {
-                            pending_calls.push(dispatch_call(client.clone(), op, id, client_restart.clone(), sub_tx.clone()));
-                        }
-
-                        for (id, s) in open_subscriptions.iter() {
-                            let sub = Retry::spawn(retry_policy.clone(), || client.subscribe::<serde_json::Value, _>(&s.subscribe_method, s.params.clone(), &s.unsubscribe_method)).await.unwrap();
-
-                            tokio::spawn(subscription_handler(
-                                s.tx.clone(),
-                                sub,
-                                client_restart.clone(),
-                                sub_tx.clone(),
-                                *id,
-                            ));
-                        }
-
+                        client = match reconnect(&url, &mut pending_calls, vec![(id, op)], reconnect_cnt.clone(), retry_policy.clone(), sub_tx.clone(), &open_subscriptions).await {
+                            Ok(client) => client,
+                            Err(e) => {
+                                tracing::error!("Failed to reconnect/re-establish subscriptions: {e}; terminating the connection");
+                                break;
+                            }
+                       };
                     }
                     _ => (),
                 }
             }
 
+            // The connection was terminated and try to reconnect.
             _ = client.on_disconnect() => {
-                tracing::info!("Connection closed; reconnecting");
-
-                let mut dispatch = Vec::new();
-
-                // All futures should return now because the connection has been terminated.
-                while !pending_calls.is_empty() {
-                    match pending_calls.next().await {
-                        Some(Ok(_)) | None => {}
-                        Some(Err(Closed { op, id })) => {
-                            dispatch.push((id, op));
-                        }
-                    };
-                }
-
-                client_restart.fetch_add(1, Ordering::SeqCst);
-                client = Retry::spawn(retry_policy.clone(), || ws_client(&url)).await.unwrap();
-
-                for (id, op) in dispatch {
-                    pending_calls.push(dispatch_call(client.clone(), op, id, client_restart.clone(), sub_tx.clone()));
-                }
-
-                for (id, s) in open_subscriptions.iter() {
-                    let sub = Retry::spawn(retry_policy.clone(), || client.subscribe::<serde_json::Value, _>(&s.subscribe_method, s.params.clone(), &s.unsubscribe_method)).await.unwrap();
-
-                    tokio::spawn(subscription_handler(
-                        s.tx.clone(),
-                        sub,
-                        client_restart.clone(),
-                        sub_tx.clone(),
-                        *id,
-                    ));
-                }
+               client = match reconnect(&url, &mut pending_calls, Vec::new(), reconnect_cnt.clone(), retry_policy.clone(), sub_tx.clone(), &open_subscriptions).await {
+                    Ok(client) => client,
+                    Err(e) => {
+                        tracing::error!("Failed to reconnect/re-establish subscriptions: {e}; terminating the connection");
+                        break;
+                    }
+               };
             }
 
             // Subscription was closed
@@ -356,19 +355,93 @@ async fn background_task<P>(
     }
 }
 
+async fn reconnect<P>(
+    url: &str,
+    pending_calls: &mut MaybePendingFutures<
+        BoxFuture<'static, Result<Option<(usize, RetrySubscription)>, Closed>>,
+    >,
+    mut dispatch: Vec<(usize, Op)>,
+    reconnect_cnt: ReconnectCounter,
+    retry_policy: P,
+    sub_tx: UnboundedSender<usize>,
+    open_subscriptions: &HashMap<usize, RetrySubscription>,
+) -> Result<Arc<WsClient>, RpcError>
+where
+    P: Iterator<Item = Duration> + Send + 'static + Clone,
+{
+    tracing::info!("Connection closed; reconnecting");
+
+    // All futures should return now because the connection has been terminated.
+    while !pending_calls.is_empty() {
+        match pending_calls.next().await {
+            Some(Ok(_)) | None => {}
+            Some(Err(Closed { op, id })) => {
+                dispatch.push((id, op));
+            }
+        };
+    }
+
+    reconnect_cnt.inc();
+    let client = Retry::spawn(retry_policy.clone(), || ws_client(url)).await?;
+
+    for (id, op) in dispatch {
+        pending_calls.push(
+            dispatch_call(
+                client.clone(),
+                op,
+                id,
+                reconnect_cnt.clone(),
+                sub_tx.clone(),
+            )
+            .boxed(),
+        );
+    }
+
+    for (id, s) in open_subscriptions.iter() {
+        let sub = Retry::spawn(retry_policy.clone(), || {
+            client.subscribe::<serde_json::Value, _>(
+                &s.subscribe_method,
+                s.params.clone(),
+                &s.unsubscribe_method,
+            )
+        })
+        .await?;
+
+        tokio::spawn(subscription_handler(
+            s.tx.clone(),
+            sub,
+            reconnect_cnt.clone(),
+            sub_tx.clone(),
+            *id,
+        ));
+    }
+
+    Ok(client)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::future::Either;
     use jsonrpsee::{
         rpc_params,
         server::{Server, ServerHandle},
         RpcModule, SubscriptionMessage,
     };
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    fn init_logger() {
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap();
+        _ = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .finish()
+            .try_init();
+    }
 
     #[tokio::test]
     async fn call_works() {
-        _ = tracing_subscriber::fmt().try_init();
-        let (_handle, addr) = run_server(None).await.unwrap();
+        init_logger();
+        let (_handle, addr) = run_server().await.unwrap();
 
         let client = ReconnectingWsClient::new(addr, ExponentialBackoff::from_millis(10))
             .await
@@ -382,8 +455,8 @@ mod tests {
 
     #[tokio::test]
     async fn sub_works() {
-        _ = tracing_subscriber::fmt().try_init();
-        let (_handle, addr) = run_server(None).await.unwrap();
+        init_logger();
+        let (_handle, addr) = run_server().await.unwrap();
 
         let client = ReconnectingWsClient::new(addr, ExponentialBackoff::from_millis(10))
             .await
@@ -402,9 +475,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconn_works() {
-        _ = tracing_subscriber::fmt().try_init();
-        let (handle, addr) = run_server(None).await.unwrap();
+    async fn reconn_sub_works() {
+        init_logger();
+        let (handle, addr) = run_server().await.unwrap();
 
         let client = ReconnectingWsClient::new(addr.clone(), ExponentialBackoff::from_millis(10))
             .await
@@ -423,16 +496,56 @@ mod tests {
         handle.stopped().await;
 
         // Restart the server.
-        let (_handle, _) = run_server(Some(&addr)).await.unwrap();
+        let (_handle, _) = run_server_with_settings(Some(&addr), false).await.unwrap();
 
         // Ensure that the client reconnects and that subscription keep running when
         // the connection is established again.
         for _ in 0..10 {
             assert!(sub.recv().await.is_some());
         }
+
+        assert_eq!(client.retry_count(), 1);
     }
 
-    async fn run_server(url: Option<&str>) -> anyhow::Result<(ServerHandle, String)> {
+    #[tokio::test]
+    async fn reconn_calls_works() {
+        init_logger();
+        let (handle, addr) = run_server_with_settings(None, true).await.unwrap();
+
+        let client = Arc::new(
+            ReconnectingWsClient::new(addr.clone(), ExponentialBackoff::from_millis(10))
+                .await
+                .unwrap(),
+        );
+
+        let req_fut = client
+            .request("say_hello".to_string(), rpc_params![])
+            .boxed();
+        let timeout_fut = tokio::time::sleep(Duration::from_secs(5));
+
+        // If the call isn't replied in 5 secs then it's regarded as it's still pending.
+        let req_fut = match futures::future::select(Box::pin(timeout_fut), req_fut).await {
+            Either::Left((_, f)) => f,
+            Either::Right(_) => panic!("RPC call finished"),
+        };
+
+        let _ = handle.stop();
+        handle.stopped().await;
+
+        // Restart the server and allow the call to complete.
+        let (_handle, _) = run_server_with_settings(Some(&addr), false).await.unwrap();
+
+        assert!(req_fut.await.is_ok());
+    }
+
+    async fn run_server() -> anyhow::Result<(ServerHandle, String)> {
+        run_server_with_settings(None, false).await
+    }
+
+    async fn run_server_with_settings(
+        url: Option<&str>,
+        dont_respond_to_method_calls: bool,
+    ) -> anyhow::Result<(ServerHandle, String)> {
         let sockaddr = match url {
             Some(url) => url.strip_prefix("ws://").unwrap(),
             None => "127.0.0.1:0",
@@ -441,7 +554,15 @@ mod tests {
         let server = Server::builder().build(sockaddr).await?;
         let mut module = RpcModule::new(());
 
-        module.register_method("say_hello", |_, _| "lo")?;
+        if dont_respond_to_method_calls {
+            module.register_async_method("say_hello", |_, _| async {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                "lo"
+            })?;
+        } else {
+            module.register_async_method("say_hello", |_, _| async { "lo" })?;
+        }
+
         module.register_subscription(
             "subscribe_lo",
             "subscribe_lo",
