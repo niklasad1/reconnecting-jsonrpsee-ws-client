@@ -17,7 +17,7 @@
 //!
 //! // Connect to a remote node a retry with exponential backoff.
 //!
-//! let client = ReconnectingWsClient::new("ws://example.com", ExponentialBackoff::from_millis(10)).await.unwrap();
+//! let client = ReconnectingWsClient::new("ws://example.com", ExponentialBackoff::from_millis(10), PingConfig::Enabled(Duration::from_secs(6)))).await.unwrap();
 //! let mut sub = client.subscribe("subscribe_lo".to_string(), rpc_params![], "unsubscribe_lo".to_string()).await.unwrap();
 //! let msg = sub.recv().await.unwrap();
 //!
@@ -47,6 +47,15 @@ use utils::{MaybePendingFutures, ReconnectCounter};
 pub struct ReconnectingWsClient {
     tx: mpsc::UnboundedSender<Op>,
     reconnect_cnt: ReconnectCounter,
+}
+
+/// Websocket ping/pong configuration.
+#[derive(Debug, Clone, Copy)]
+pub enum PingConfig {
+    /// Disabled.
+    Disabled,
+    /// Pings are sent out specified interval.
+    Enabled(Duration),
 }
 
 impl ReconnectingWsClient {
@@ -97,12 +106,16 @@ impl ReconnectingWsClient {
 }
 
 impl ReconnectingWsClient {
-    pub async fn new<P>(url: String, retry_policy: P) -> Result<Self, RpcError>
+    pub async fn new<P>(
+        url: String,
+        retry_policy: P,
+        ping_config: PingConfig,
+    ) -> Result<Self, RpcError>
     where
         P: Iterator<Item = Duration> + Send + 'static + Clone,
     {
         let (tx, rx) = mpsc::unbounded_channel();
-        let client = Retry::spawn(retry_policy.clone(), || ws_client(&url)).await?;
+        let client = Retry::spawn(retry_policy.clone(), || ws_client(&url, ping_config)).await?;
         let reconnect_cnt = ReconnectCounter::new();
 
         tokio::spawn(background_task(
@@ -111,6 +124,7 @@ impl ReconnectingWsClient {
             retry_policy,
             url,
             reconnect_cnt.clone(),
+            ping_config,
         ));
 
         Ok(Self { tx, reconnect_cnt })
@@ -148,8 +162,16 @@ pub struct Closed {
     id: usize,
 }
 
-async fn ws_client(url: &str) -> Result<Arc<WsClient>, RpcError> {
-    let client = WsClientBuilder::default().build(url).await?;
+async fn ws_client(url: &str, ping_config: PingConfig) -> Result<Arc<WsClient>, RpcError> {
+    let client = if let PingConfig::Enabled(dur) = ping_config {
+        WsClientBuilder::default()
+            .ping_interval(dur)
+            .build(url)
+            .await?
+    } else {
+        WsClientBuilder::default().build(url).await?
+    };
+
     Ok(Arc::new(client))
 }
 
@@ -280,6 +302,7 @@ async fn background_task<P>(
     retry_policy: P,
     url: String,
     reconnect_cnt: ReconnectCounter,
+    ping_config: PingConfig,
 ) where
     P: Iterator<Item = Duration> + Send + 'static + Clone,
 {
@@ -320,7 +343,7 @@ async fn background_task<P>(
                     }
                     // The connection was closed, re-connect and try to send all messages again.
                     Some(Err(Closed { op, id })) => {
-                        client = match reconnect(&url, &mut pending_calls, vec![(id, op)], reconnect_cnt.clone(), retry_policy.clone(), sub_tx.clone(), &open_subscriptions).await {
+                        client = match reconnect(&url, ping_config, &mut pending_calls, vec![(id, op)], reconnect_cnt.clone(), retry_policy.clone(), sub_tx.clone(), &open_subscriptions).await {
                             Ok(client) => client,
                             Err(e) => {
                                 tracing::error!("Failed to reconnect/re-establish subscriptions: {e}; terminating the connection");
@@ -334,7 +357,7 @@ async fn background_task<P>(
 
             // The connection was terminated and try to reconnect.
             _ = client.on_disconnect() => {
-               client = match reconnect(&url, &mut pending_calls, Vec::new(), reconnect_cnt.clone(), retry_policy.clone(), sub_tx.clone(), &open_subscriptions).await {
+               client = match reconnect(&url, ping_config, &mut pending_calls, Vec::new(), reconnect_cnt.clone(), retry_policy.clone(), sub_tx.clone(), &open_subscriptions).await {
                     Ok(client) => client,
                     Err(e) => {
                         tracing::error!("Failed to reconnect/re-establish subscriptions: {e}; terminating the connection");
@@ -357,6 +380,7 @@ async fn background_task<P>(
 
 async fn reconnect<P>(
     url: &str,
+    ping_config: PingConfig,
     pending_calls: &mut MaybePendingFutures<
         BoxFuture<'static, Result<Option<(usize, RetrySubscription)>, Closed>>,
     >,
@@ -382,7 +406,7 @@ where
     }
 
     reconnect_cnt.inc();
-    let client = Retry::spawn(retry_policy.clone(), || ws_client(url)).await?;
+    let client = Retry::spawn(retry_policy.clone(), || ws_client(url, ping_config)).await?;
 
     for (id, op) in dispatch {
         pending_calls.push(
@@ -443,9 +467,13 @@ mod tests {
         init_logger();
         let (_handle, addr) = run_server().await.unwrap();
 
-        let client = ReconnectingWsClient::new(addr, ExponentialBackoff::from_millis(10))
-            .await
-            .unwrap();
+        let client = ReconnectingWsClient::new(
+            addr,
+            ExponentialBackoff::from_millis(10),
+            PingConfig::Disabled,
+        )
+        .await
+        .unwrap();
 
         assert!(client
             .request("say_hello".to_string(), rpc_params![])
@@ -458,9 +486,13 @@ mod tests {
         init_logger();
         let (_handle, addr) = run_server().await.unwrap();
 
-        let client = ReconnectingWsClient::new(addr, ExponentialBackoff::from_millis(10))
-            .await
-            .unwrap();
+        let client = ReconnectingWsClient::new(
+            addr,
+            ExponentialBackoff::from_millis(10),
+            PingConfig::Disabled,
+        )
+        .await
+        .unwrap();
 
         let mut sub = client
             .subscribe(
@@ -479,9 +511,13 @@ mod tests {
         init_logger();
         let (handle, addr) = run_server().await.unwrap();
 
-        let client = ReconnectingWsClient::new(addr.clone(), ExponentialBackoff::from_millis(10))
-            .await
-            .unwrap();
+        let client = ReconnectingWsClient::new(
+            addr.clone(),
+            ExponentialBackoff::from_millis(10),
+            PingConfig::Disabled,
+        )
+        .await
+        .unwrap();
 
         let mut sub = client
             .subscribe(
@@ -513,9 +549,13 @@ mod tests {
         let (handle, addr) = run_server_with_settings(None, true).await.unwrap();
 
         let client = Arc::new(
-            ReconnectingWsClient::new(addr.clone(), ExponentialBackoff::from_millis(10))
-                .await
-                .unwrap(),
+            ReconnectingWsClient::new(
+                addr.clone(),
+                ExponentialBackoff::from_millis(10),
+                PingConfig::Disabled,
+            )
+            .await
+            .unwrap(),
         );
 
         let req_fut = client
