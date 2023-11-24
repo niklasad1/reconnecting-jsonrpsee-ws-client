@@ -29,7 +29,7 @@ use futures::{future::BoxFuture, FutureExt, StreamExt};
 use jsonrpsee::{
     core::client::{ClientT, Subscription},
     core::Error as RpcError,
-    core::{client::SubscriptionClientT, params::ArrayParams},
+    core::{client::SubscriptionClientT, params::ArrayParams, traits::ToRpcParams},
     ws_client::{WsClient, WsClientBuilder},
 };
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -44,8 +44,11 @@ use utils::{MaybePendingFutures, ReconnectCounter};
 /// JSON-RPC client that reconnects automatically and may loose
 /// subscription notifications when it reconnects.
 #[derive(Clone)]
-pub struct ReconnectingWsClient {
-    tx: mpsc::UnboundedSender<Op>,
+pub struct ReconnectingWsClient<Params> 
+where 
+    Params: ToRpcParams + Send + Sync + Clone + std::fmt::Debug + 'static
+{
+    tx: mpsc::UnboundedSender<Op<Params>>,
     reconnect_cnt: ReconnectCounter,
 }
 
@@ -58,11 +61,14 @@ pub enum PingConfig {
     Enabled(Duration),
 }
 
-impl ReconnectingWsClient {
+impl<Params> ReconnectingWsClient<Params>
+where
+    Params: ToRpcParams + Send + Sync + Clone + std::fmt::Debug + 'static
+{
     pub async fn request(
         &self,
         method: String,
-        params: ArrayParams,
+        params: Params,
     ) -> Result<serde_json::Value, RpcError> {
         let (tx, rx) = oneshot::channel();
         self.tx
@@ -82,7 +88,7 @@ impl ReconnectingWsClient {
     pub async fn subscribe(
         &self,
         subscribe_method: String,
-        params: ArrayParams,
+        params: Params,
         unsubscribe_method: String,
     ) -> Result<mpsc::UnboundedReceiver<Result<serde_json::Value, RpcError>>, RpcError> {
         let (tx, rx) = oneshot::channel();
@@ -105,7 +111,10 @@ impl ReconnectingWsClient {
     }
 }
 
-impl ReconnectingWsClient {
+impl<Params> ReconnectingWsClient<Params>
+where
+    Params: ToRpcParams + Send + Sync + Clone + std::fmt::Debug + 'static
+{
     pub async fn new<P>(
         url: String,
         retry_policy: P,
@@ -132,15 +141,18 @@ impl ReconnectingWsClient {
 }
 
 #[derive(Debug)]
-pub enum Op {
+pub enum Op<Params>
+where
+    Params: ToRpcParams + Send + Sync + Clone + std::fmt::Debug + 'static
+{
     Call {
         method: String,
-        params: ArrayParams,
+        params: Params,
         send_back: oneshot::Sender<Result<serde_json::Value, RpcError>>,
     },
     Subscription {
         subscribe_method: String,
-        params: ArrayParams,
+        params: Params,
         unsubscribe_method: String,
         send_back: oneshot::Sender<
             Result<mpsc::UnboundedReceiver<Result<serde_json::Value, RpcError>>, RpcError>,
@@ -149,16 +161,22 @@ pub enum Op {
 }
 
 #[derive(Debug)]
-struct RetrySubscription {
+struct RetrySubscription<Params>
+where
+    Params: ToRpcParams + Send + Sync + Clone + std::fmt::Debug + 'static
+{
     tx: mpsc::UnboundedSender<Result<serde_json::Value, RpcError>>,
     subscribe_method: String,
-    params: ArrayParams,
+    params: Params,
     unsubscribe_method: String,
 }
 
 #[derive(Debug)]
-pub struct Closed {
-    op: Op,
+pub struct Closed<Params> 
+where
+    Params: ToRpcParams + Send + Sync + Clone + std::fmt::Debug + 'static
+{
+    op: Op<Params>,
     id: usize,
 }
 
@@ -175,13 +193,16 @@ async fn ws_client(url: &str, ping_config: PingConfig) -> Result<Arc<WsClient>, 
     Ok(Arc::new(client))
 }
 
-async fn dispatch_call(
+async fn dispatch_call<Params>(
     client: Arc<WsClient>,
-    op: Op,
+    op: Op<Params>,
     id: usize,
     reconnect_cnt: ReconnectCounter,
     sub_closed: mpsc::UnboundedSender<usize>,
-) -> Result<Option<(usize, RetrySubscription)>, Closed> {
+) -> Result<Option<(usize, RetrySubscription<Params>)>, Closed<Params>> 
+where 
+    Params: ToRpcParams + Send + Sync + Clone + std::fmt::Debug + 'static
+{
     match op {
         Op::Call {
             method,
@@ -296,15 +317,16 @@ async fn subscription_handler(
     }
 }
 
-async fn background_task<P>(
+async fn background_task<P, Params>(
     mut client: Arc<WsClient>,
-    mut rx: UnboundedReceiver<Op>,
+    mut rx: UnboundedReceiver<Op<Params>>,
     retry_policy: P,
     url: String,
     reconnect_cnt: ReconnectCounter,
     ping_config: PingConfig,
 ) where
     P: Iterator<Item = Duration> + Send + 'static + Clone,
+    Params: ToRpcParams + Send + Sync + Clone + std::fmt::Debug + 'static
 {
     let (sub_tx, mut sub_rx) = mpsc::unbounded_channel();
     let mut pending_calls = MaybePendingFutures::new();
@@ -378,20 +400,21 @@ async fn background_task<P>(
     }
 }
 
-async fn reconnect<P>(
+async fn reconnect<P, Params>(
     url: &str,
     ping_config: PingConfig,
     pending_calls: &mut MaybePendingFutures<
-        BoxFuture<'static, Result<Option<(usize, RetrySubscription)>, Closed>>,
+        BoxFuture<'static, Result<Option<(usize, RetrySubscription<Params>)>, Closed<Params>>>,
     >,
-    mut dispatch: Vec<(usize, Op)>,
+    mut dispatch: Vec<(usize, Op<Params>)>,
     reconnect_cnt: ReconnectCounter,
     retry_policy: P,
     sub_tx: UnboundedSender<usize>,
-    open_subscriptions: &HashMap<usize, RetrySubscription>,
+    open_subscriptions: &HashMap<usize, RetrySubscription<Params>>,
 ) -> Result<Arc<WsClient>, RpcError>
 where
     P: Iterator<Item = Duration> + Send + 'static + Clone,
+    Params: ToRpcParams + Send + Sync + Clone + std::fmt::Debug + 'static
 {
     tracing::info!("Connection closed; reconnecting");
 
