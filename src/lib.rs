@@ -2,7 +2,7 @@
 //! which automatically reconnects under the hood
 //! without that the user has to restart it manually
 //! by re-transmitting pending calls and re-establish subscriptions
-//! that normally be closed on disconnect.
+//! that are closed on disconnect.
 //!
 //! The tricky part is subscription which may loose a few notifications
 //! when re-connecting where it's not possible to know which ones.
@@ -25,30 +25,40 @@
 
 pub mod utils;
 
+pub use tokio_retry::strategy::*;
+
 use futures::{future::BoxFuture, FutureExt, StreamExt};
 use jsonrpsee::{
     core::client::{ClientT, Subscription},
     core::Error as RpcError,
-    core::{client::SubscriptionClientT, params::ArrayParams, traits::ToRpcParams},
+    core::{client::SubscriptionClientT, traits::ToRpcParams},
     ws_client::{WsClient, WsClientBuilder},
 };
+use serde_json::value::RawValue;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::{
     mpsc::{self, UnboundedReceiver, UnboundedSender},
     oneshot,
 };
-pub use tokio_retry::strategy::*;
 use tokio_retry::Retry;
 use utils::{MaybePendingFutures, ReconnectCounter};
+
+type MethodResult = Result<Box<RawValue>, RpcError>;
+
+#[derive(Debug, Clone)]
+pub struct RpcParams(Option<Box<RawValue>>);
+
+impl ToRpcParams for RpcParams {
+    fn to_rpc_params(self) -> Result<Option<Box<RawValue>>, RpcError> {
+        Ok(self.0)
+    }
+}
 
 /// JSON-RPC client that reconnects automatically and may loose
 /// subscription notifications when it reconnects.
 #[derive(Clone)]
-pub struct ReconnectingWsClient<Params> 
-where 
-    Params: ToRpcParams + Send + Sync + Clone + std::fmt::Debug + 'static
-{
-    tx: mpsc::UnboundedSender<Op<Params>>,
+pub struct ReconnectingWsClient {
+    tx: mpsc::UnboundedSender<Op>,
     reconnect_cnt: ReconnectCounter,
 }
 
@@ -61,16 +71,23 @@ pub enum PingConfig {
     Enabled(Duration),
 }
 
-impl<Params> ReconnectingWsClient<Params>
-where
-    Params: ToRpcParams + Send + Sync + Clone + std::fmt::Debug + 'static
-{
-    pub async fn request(
+impl ReconnectingWsClient {
+    pub async fn request<P: ToRpcParams>(
         &self,
         method: String,
-        params: Params,
-    ) -> Result<serde_json::Value, RpcError> {
+        params: P,
+    ) -> Result<Box<RawValue>, RpcError> {
+        let params = RpcParams(params.to_rpc_params()?);
+        self.inner_request(method, params).await
+    }
+
+    async fn inner_request(
+        &self,
+        method: String,
+        params: RpcParams,
+    ) -> Result<Box<RawValue>, RpcError> {
         let (tx, rx) = oneshot::channel();
+
         self.tx
             .send(Op::Call {
                 method,
@@ -85,12 +102,23 @@ where
         rp
     }
 
-    pub async fn subscribe(
+    pub async fn subscribe<P: ToRpcParams>(
         &self,
         subscribe_method: String,
-        params: Params,
+        params: P,
         unsubscribe_method: String,
-    ) -> Result<mpsc::UnboundedReceiver<Result<serde_json::Value, RpcError>>, RpcError> {
+    ) -> Result<mpsc::UnboundedReceiver<MethodResult>, RpcError> {
+        let params = RpcParams(params.to_rpc_params()?);
+        self.inner_subscribe(subscribe_method, params, unsubscribe_method)
+            .await
+    }
+
+    pub async fn inner_subscribe(
+        &self,
+        subscribe_method: String,
+        params: RpcParams,
+        unsubscribe_method: String,
+    ) -> Result<mpsc::UnboundedReceiver<MethodResult>, RpcError> {
         let (tx, rx) = oneshot::channel();
         self.tx
             .send(Op::Subscription {
@@ -111,10 +139,7 @@ where
     }
 }
 
-impl<Params> ReconnectingWsClient<Params>
-where
-    Params: ToRpcParams + Send + Sync + Clone + std::fmt::Debug + 'static
-{
+impl ReconnectingWsClient {
     pub async fn new<P>(
         url: String,
         retry_policy: P,
@@ -140,43 +165,71 @@ where
     }
 }
 
+#[cfg(feature = "subxt")]
+impl subxt::backend::rpc::RpcClientT for ReconnectingWsClient {
+    fn request_raw<'a>(
+        &'a self,
+        method: &'a str,
+        params: Option<Box<RawValue>>,
+    ) -> subxt::backend::rpc::RawRpcFuture<'a, Box<serde_json::value::RawValue>> {
+        async {
+            self.inner_request(method.to_string(), RpcParams(params))
+                .await
+                .map_err(|e| subxt::error::RpcError::ClientError(Box::new(e)))
+        }
+        .boxed()
+    }
+
+    fn subscribe_raw<'a>(
+        &'a self,
+        sub: &'a str,
+        params: Option<Box<RawValue>>,
+        unsub: &'a str,
+    ) -> subxt::backend::rpc::RawRpcFuture<'a, subxt::backend::rpc::RawRpcSubscription> {
+        use futures::TryStreamExt;
+
+        async {
+            let sub = self
+                .inner_subscribe(sub.to_string(), RpcParams(params), unsub.to_string())
+                .await
+                .map_err(|e| subxt::error::RpcError::ClientError(Box::new(e)))?;
+
+            let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(sub)
+                .map_err(|e| subxt::error::RpcError::ClientError(Box::new(e)))
+                .boxed();
+
+            Ok(subxt::backend::rpc::RawRpcSubscription { stream, id: None })
+        }
+        .boxed()
+    }
+}
+
 #[derive(Debug)]
-pub enum Op<Params>
-where
-    Params: ToRpcParams + Send + Sync + Clone + std::fmt::Debug + 'static
-{
+pub enum Op {
     Call {
         method: String,
-        params: Params,
-        send_back: oneshot::Sender<Result<serde_json::Value, RpcError>>,
+        params: RpcParams,
+        send_back: oneshot::Sender<MethodResult>,
     },
     Subscription {
         subscribe_method: String,
-        params: Params,
+        params: RpcParams,
         unsubscribe_method: String,
-        send_back: oneshot::Sender<
-            Result<mpsc::UnboundedReceiver<Result<serde_json::Value, RpcError>>, RpcError>,
-        >,
+        send_back: oneshot::Sender<Result<mpsc::UnboundedReceiver<MethodResult>, RpcError>>,
     },
 }
 
 #[derive(Debug)]
-struct RetrySubscription<Params>
-where
-    Params: ToRpcParams + Send + Sync + Clone + std::fmt::Debug + 'static
-{
-    tx: mpsc::UnboundedSender<Result<serde_json::Value, RpcError>>,
+struct RetrySubscription {
+    tx: mpsc::UnboundedSender<MethodResult>,
     subscribe_method: String,
-    params: Params,
+    params: RpcParams,
     unsubscribe_method: String,
 }
 
 #[derive(Debug)]
-pub struct Closed<Params> 
-where
-    Params: ToRpcParams + Send + Sync + Clone + std::fmt::Debug + 'static
-{
-    op: Op<Params>,
+pub struct Closed {
+    op: Op,
     id: usize,
 }
 
@@ -193,16 +246,13 @@ async fn ws_client(url: &str, ping_config: PingConfig) -> Result<Arc<WsClient>, 
     Ok(Arc::new(client))
 }
 
-async fn dispatch_call<Params>(
+async fn dispatch_call(
     client: Arc<WsClient>,
-    op: Op<Params>,
+    op: Op,
     id: usize,
     reconnect_cnt: ReconnectCounter,
     sub_closed: mpsc::UnboundedSender<usize>,
-) -> Result<Option<(usize, RetrySubscription<Params>)>, Closed<Params>> 
-where 
-    Params: ToRpcParams + Send + Sync + Clone + std::fmt::Debug + 'static
-{
+) -> Result<Option<(usize, RetrySubscription)>, Closed> {
     match op {
         Op::Call {
             method,
@@ -210,11 +260,12 @@ where
             send_back,
         } => {
             match client
-                .request::<serde_json::Value, _>(&method, params.clone())
+                .request::<Box<RawValue>, _>(&method, params.clone())
                 .await
             {
                 Ok(rp) => {
-                    send_back.send(Ok(rp)).unwrap();
+                    // Fails only if the request is dropped.
+                    let _ = send_back.send(Ok(rp));
                     Ok(None)
                 }
                 Err(RpcError::RestartNeeded(_)) => Err(Closed {
@@ -226,7 +277,8 @@ where
                     id,
                 }),
                 Err(e) => {
-                    send_back.send(Err(e)).unwrap();
+                    // Fails only if the request is dropped.
+                    let _ = send_back.send(Err(e));
                     Ok(None)
                 }
             }
@@ -238,7 +290,7 @@ where
             send_back,
         } => {
             match client
-                .subscribe::<serde_json::Value, _>(
+                .subscribe::<Box<RawValue>, _>(
                     &subscribe_method,
                     params.clone(),
                     &unsubscribe_method,
@@ -263,6 +315,7 @@ where
                         unsubscribe_method,
                     };
 
+                    // Fails only if the request is dropped.
                     let _ = send_back.send(Ok(rx));
                     Ok(Some((id, sub)))
                 }
@@ -276,6 +329,7 @@ where
                     id,
                 }),
                 Err(e) => {
+                    // Fails only if the request is dropped.
                     let _ = send_back.send(Err(e));
                     Ok(None)
                 }
@@ -284,10 +338,10 @@ where
     }
 }
 
-/// Sends a message to main task if subscription was closed without that connection was closed.
+/// Sends a message to main task if the subscription was closed without that connection was closed.
 async fn subscription_handler(
-    tx: UnboundedSender<Result<serde_json::Value, RpcError>>,
-    mut sub: Subscription<serde_json::Value>,
+    tx: UnboundedSender<MethodResult>,
+    mut sub: Subscription<Box<RawValue>>,
     reconnect_cnt: ReconnectCounter,
     sub_closed: mpsc::UnboundedSender<usize>,
     id: usize,
@@ -317,16 +371,15 @@ async fn subscription_handler(
     }
 }
 
-async fn background_task<P, Params>(
+async fn background_task<P>(
     mut client: Arc<WsClient>,
-    mut rx: UnboundedReceiver<Op<Params>>,
+    mut rx: UnboundedReceiver<Op>,
     retry_policy: P,
     url: String,
     reconnect_cnt: ReconnectCounter,
     ping_config: PingConfig,
 ) where
     P: Iterator<Item = Duration> + Send + 'static + Clone,
-    Params: ToRpcParams + Send + Sync + Clone + std::fmt::Debug + 'static
 {
     let (sub_tx, mut sub_rx) = mpsc::unbounded_channel();
     let mut pending_calls = MaybePendingFutures::new();
@@ -342,7 +395,6 @@ async fn background_task<P, Params>(
         );
 
         tokio::select! {
-
             // An incoming JSON-RPC call to dispatch.
             next_message = rx.recv() => {
                 tracing::trace!("next_message: {:?}", next_message);
@@ -400,21 +452,20 @@ async fn background_task<P, Params>(
     }
 }
 
-async fn reconnect<P, Params>(
+async fn reconnect<P>(
     url: &str,
     ping_config: PingConfig,
     pending_calls: &mut MaybePendingFutures<
-        BoxFuture<'static, Result<Option<(usize, RetrySubscription<Params>)>, Closed<Params>>>,
+        BoxFuture<'static, Result<Option<(usize, RetrySubscription)>, Closed>>,
     >,
-    mut dispatch: Vec<(usize, Op<Params>)>,
+    mut dispatch: Vec<(usize, Op)>,
     reconnect_cnt: ReconnectCounter,
     retry_policy: P,
     sub_tx: UnboundedSender<usize>,
-    open_subscriptions: &HashMap<usize, RetrySubscription<Params>>,
+    open_subscriptions: &HashMap<usize, RetrySubscription>,
 ) -> Result<Arc<WsClient>, RpcError>
 where
     P: Iterator<Item = Duration> + Send + 'static + Clone,
-    Params: ToRpcParams + Send + Sync + Clone + std::fmt::Debug + 'static
 {
     tracing::info!("Connection closed; reconnecting");
 
@@ -446,7 +497,7 @@ where
 
     for (id, s) in open_subscriptions.iter() {
         let sub = Retry::spawn(retry_policy.clone(), || {
-            client.subscribe::<serde_json::Value, _>(
+            client.subscribe::<Box<RawValue>, _>(
                 &s.subscribe_method,
                 s.params.clone(),
                 &s.unsubscribe_method,
