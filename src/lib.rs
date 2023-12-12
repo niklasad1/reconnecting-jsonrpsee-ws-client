@@ -8,7 +8,7 @@
 //! when re-connecting where it's not possible to know which ones.
 //!
 //! Lost subscription notifications may be very important to know in some scenarios where
-//! this crate is not recommended.
+//! then crate is not recommended.
 //!
 //! # Examples
 //!
