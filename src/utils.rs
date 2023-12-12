@@ -54,6 +54,12 @@ impl<Fut: Future> Stream for MaybePendingFutures<Fut> {
 #[derive(Clone, Debug)]
 pub struct ReconnectCounter(Arc<AtomicUsize>);
 
+impl Default for ReconnectCounter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ReconnectCounter {
     pub fn new() -> Self {
         Self(Arc::new(AtomicUsize::new(0)))
