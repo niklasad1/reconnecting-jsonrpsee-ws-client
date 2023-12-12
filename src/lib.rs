@@ -128,10 +128,8 @@ impl ReconnectingWsClient {
                 send_back: tx,
             })
             .map_err(|_| RpcError::Custom("Client is dropped".to_string()))?;
-        let rp = rx
-            .await
-            .map_err(|_| RpcError::Custom("Client is dropped".to_string()))?;
-        rp
+        rx.await
+            .map_err(|_| RpcError::Custom("Client is dropped".to_string()))?
     }
 
     pub fn retry_count(&self) -> usize {
@@ -417,7 +415,17 @@ async fn background_task<P>(
                     }
                     // The connection was closed, re-connect and try to send all messages again.
                     Some(Err(Closed { op, id })) => {
-                        client = match reconnect(&url, ping_config, &mut pending_calls, vec![(id, op)], reconnect_cnt.clone(), retry_policy.clone(), sub_tx.clone(), &open_subscriptions).await {
+                        let params = ReconnectParams {
+                            url: &url,
+                            ping_config,
+                            pending_calls: &mut pending_calls,
+                            dispatch: vec![(id, op)],
+                            reconnect_cnt: reconnect_cnt.clone(),
+                            retry_policy: retry_policy.clone(),
+                            sub_tx: sub_tx.clone(),
+                            open_subscriptions: &open_subscriptions
+                        };
+                        client = match reconnect(params).await {
                             Ok(client) => client,
                             Err(e) => {
                                 tracing::error!("Failed to reconnect/re-establish subscriptions: {e}; terminating the connection");
@@ -431,7 +439,18 @@ async fn background_task<P>(
 
             // The connection was terminated and try to reconnect.
             _ = client.on_disconnect() => {
-               client = match reconnect(&url, ping_config, &mut pending_calls, Vec::new(), reconnect_cnt.clone(), retry_policy.clone(), sub_tx.clone(), &open_subscriptions).await {
+                let params = ReconnectParams {
+                    url: &url,
+                    ping_config,
+                    pending_calls: &mut pending_calls,
+                    dispatch: vec![],
+                    reconnect_cnt: reconnect_cnt.clone(),
+                    retry_policy: retry_policy.clone(),
+                    sub_tx: sub_tx.clone(),
+                    open_subscriptions: &open_subscriptions
+                };
+
+               client = match reconnect(params).await {
                     Ok(client) => client,
                     Err(e) => {
                         tracing::error!("Failed to reconnect/re-establish subscriptions: {e}; terminating the connection");
@@ -452,22 +471,35 @@ async fn background_task<P>(
     }
 }
 
-async fn reconnect<P>(
-    url: &str,
+struct ReconnectParams<'a, P> {
+    url: &'a str,
     ping_config: PingConfig,
-    pending_calls: &mut MaybePendingFutures<
+    pending_calls: &'a mut MaybePendingFutures<
         BoxFuture<'static, Result<Option<(usize, RetrySubscription)>, Closed>>,
     >,
-    mut dispatch: Vec<(usize, Op)>,
+    dispatch: Vec<(usize, Op)>,
     reconnect_cnt: ReconnectCounter,
     retry_policy: P,
     sub_tx: UnboundedSender<usize>,
-    open_subscriptions: &HashMap<usize, RetrySubscription>,
-) -> Result<Arc<WsClient>, RpcError>
+    open_subscriptions: &'a HashMap<usize, RetrySubscription>,
+}
+
+async fn reconnect<P>(params: ReconnectParams<'_, P>) -> Result<Arc<WsClient>, RpcError>
 where
     P: Iterator<Item = Duration> + Send + 'static + Clone,
 {
     tracing::info!("Connection closed; reconnecting");
+
+    let ReconnectParams {
+        url,
+        ping_config,
+        pending_calls,
+        mut dispatch,
+        reconnect_cnt,
+        retry_policy,
+        sub_tx,
+        open_subscriptions,
+    } = params;
 
     // All futures should return now because the connection has been terminated.
     while !pending_calls.is_empty() {
@@ -529,8 +561,8 @@ mod tests {
     use tracing_subscriber::util::SubscriberInitExt;
 
     fn init_logger() {
-        let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap();
-        _ = tracing_subscriber::fmt()
+        let filter = tracing_subscriber::EnvFilter::from_default_env();
+        let _ = tracing_subscriber::fmt()
             .with_env_filter(filter)
             .finish()
             .try_init();
