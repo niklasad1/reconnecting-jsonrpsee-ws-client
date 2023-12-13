@@ -21,3 +21,10 @@ subxt = { version = "0.33", optional = true }
 jsonrpsee = { version = "0.20.3", features = ["server"] }
 anyhow = "1"
 tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
+subxt = "0.33"
+subxt-signer = "0.33"
+
+[[example]]
+name = "hello_subxt"
+path = "examples/hello_subxt.rs"
+required-features = ["subxt"]
