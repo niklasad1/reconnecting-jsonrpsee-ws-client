@@ -4,7 +4,10 @@
 //! by re-transmitting pending calls and re-establish subscriptions
 //! that are closed on disconnect.
 //!
-//! The tricky part is subscription which may loose a few notifications
+//! The retry strategy applies globally for connections, method calls
+//! and subscriptions.
+//!
+//! The tricky part is subscription which may lose a few notifications
 //! when re-connecting where it's not possible to know which ones.
 //!
 //! Lost subscription notifications may be very important to know in some scenarios where
@@ -17,7 +20,7 @@
 //!
 //! // Connect to a remote node a retry with exponential backoff.
 //!
-//! let client = ReconnectingWsClient::new("ws://example.com", ExponentialBackoff::from_millis(10), PingConfig::Enabled(Duration::from_secs(6)))).await.unwrap();
+//! let client = Client::builder().build(addr).await.unwrap();
 //! let mut sub = client.subscribe("subscribe_lo".to_string(), rpc_params![], "unsubscribe_lo".to_string()).await.unwrap();
 //! let msg = sub.recv().await.unwrap();
 //!
@@ -25,17 +28,17 @@
 
 pub mod utils;
 
+pub use jsonrpsee::types::SubscriptionId;
 pub use tokio_retry::strategy::*;
 
-use futures::{future::BoxFuture, FutureExt, StreamExt};
+use futures::{future::BoxFuture, FutureExt, Stream, StreamExt};
 use jsonrpsee::{
-    core::client::{ClientT, Subscription},
-    core::Error as RpcError,
-    core::{client::SubscriptionClientT, traits::ToRpcParams},
+    core::client::{ClientT, Subscription as RpcSubscription, SubscriptionClientT},
+    core::{client::SubscriptionKind, traits::ToRpcParams, Error as RpcError},
     ws_client::{WsClient, WsClientBuilder},
 };
 use serde_json::value::RawValue;
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, pin::Pin, sync::Arc, task, time::Duration};
 use tokio::sync::{
     mpsc::{self, UnboundedReceiver, UnboundedSender},
     oneshot,
@@ -45,6 +48,7 @@ use utils::{MaybePendingFutures, ReconnectCounter};
 
 type MethodResult = Result<Box<RawValue>, RpcError>;
 
+/// Serialized JSON-RPC params.
 #[derive(Debug, Clone)]
 pub struct RpcParams(Option<Box<RawValue>>);
 
@@ -54,24 +58,143 @@ impl ToRpcParams for RpcParams {
     }
 }
 
+pub struct Subscription {
+    id: SubscriptionId<'static>,
+    stream: mpsc::UnboundedReceiver<MethodResult>,
+}
+
+impl Subscription {
+    /// Returns the next notification from the stream.
+    /// This may return `None` if the subscription has been terminated,
+    /// which may happen if the channel becomes full or is dropped.
+    ///
+    /// **Note:** This has an identical signature to the [`StreamExt::next`]
+    /// method (and delegates to that). Import [`StreamExt`] if you'd like
+    /// access to other stream combinator methods.
+    #[allow(clippy::should_implement_trait)]
+    pub async fn next(&mut self) -> Option<MethodResult> {
+        StreamExt::next(self).await
+    }
+
+    pub fn id(&self) -> SubscriptionId<'static> {
+        self.id.clone()
+    }
+}
+
+impl Stream for Subscription {
+    type Item = MethodResult;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+    ) -> task::Poll<Option<Self::Item>> {
+        self.stream.poll_recv(cx)
+    }
+}
+
+impl std::fmt::Debug for Subscription {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!("Subscription {:?}", self.id))
+    }
+}
+
 /// JSON-RPC client that reconnects automatically and may loose
 /// subscription notifications when it reconnects.
 #[derive(Clone)]
-pub struct ReconnectingWsClient {
+pub struct Client {
     tx: mpsc::UnboundedSender<Op>,
     reconnect_cnt: ReconnectCounter,
 }
 
-/// Websocket ping/pong configuration.
-#[derive(Debug, Clone, Copy)]
-pub enum PingConfig {
-    /// Disabled.
-    Disabled,
-    /// Pings are sent out specified interval.
-    Enabled(Duration),
+/// Builder for [`Client`].
+#[derive(Clone)]
+pub struct ClientBuilder<P> {
+    max_request_size: u32,
+    max_response_size: u32,
+    retry_policy: P,
+    ping_config: Option<Duration>,
 }
 
-impl ReconnectingWsClient {
+impl Default for ClientBuilder<ExponentialBackoff> {
+    fn default() -> Self {
+        Self {
+            max_request_size: 10 * 1024 * 1024,
+            max_response_size: 10 * 1024 * 1024,
+            retry_policy: ExponentialBackoff::from_millis(10),
+            ping_config: Some(Duration::from_secs(30)),
+        }
+    }
+}
+
+impl ClientBuilder<ExponentialBackoff> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl<P> ClientBuilder<P>
+where
+    P: Iterator<Item = Duration> + Send + Sync + 'static + Clone,
+{
+    /// Configure the min response size a for websocket message.
+    pub fn max_request_size(mut self, max: u32) -> Self {
+        self.max_request_size = max;
+        self
+    }
+
+    /// Configure the max response size a for websocket message.
+    pub fn max_response_size(mut self, max: u32) -> Self {
+        self.max_response_size = max;
+        self
+    }
+
+    /// Configure which retry policy to use when a connection is lost.
+    ///
+    /// Default: Exponential backoff 10ms
+    pub fn retry_policy<T>(self, retry_policy: T) -> ClientBuilder<T> {
+        ClientBuilder {
+            max_request_size: self.max_request_size,
+            max_response_size: self.max_response_size,
+            retry_policy,
+            ping_config: self.ping_config,
+        }
+    }
+
+    /// Configure the WebSocket ping/pong interval.
+    ///
+    /// Default: 30 seconds.
+    pub fn ws_ping(mut self, dur: Duration) -> Self {
+        self.ping_config = Some(dur);
+        self
+    }
+
+    /// Disable WebSocket ping/pongs.
+    ///
+    /// Default: disabled.
+    pub fn disable_ws_ping(mut self) -> Self {
+        self.ping_config = None;
+        self
+    }
+
+    pub async fn build(self, url: String) -> Result<Client, RpcError> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let client =
+            Retry::spawn(self.retry_policy.clone(), || ws_client(url.as_ref(), &self)).await?;
+        let reconnect_cnt = ReconnectCounter::new();
+
+        tokio::spawn(background_task(
+            client,
+            rx,
+            url,
+            reconnect_cnt.clone(),
+            self,
+        ));
+
+        Ok(Client { tx, reconnect_cnt })
+    }
+}
+
+impl Client {
     pub async fn request<P: ToRpcParams>(
         &self,
         method: String,
@@ -107,7 +230,7 @@ impl ReconnectingWsClient {
         subscribe_method: String,
         params: P,
         unsubscribe_method: String,
-    ) -> Result<mpsc::UnboundedReceiver<MethodResult>, RpcError> {
+    ) -> Result<Subscription, RpcError> {
         let params = RpcParams(params.to_rpc_params()?);
         self.inner_subscribe(subscribe_method, params, unsubscribe_method)
             .await
@@ -118,7 +241,7 @@ impl ReconnectingWsClient {
         subscribe_method: String,
         params: RpcParams,
         unsubscribe_method: String,
-    ) -> Result<mpsc::UnboundedReceiver<MethodResult>, RpcError> {
+    ) -> Result<Subscription, RpcError> {
         let (tx, rx) = oneshot::channel();
         self.tx
             .send(Op::Subscription {
@@ -137,34 +260,14 @@ impl ReconnectingWsClient {
     }
 }
 
-impl ReconnectingWsClient {
-    pub async fn new<P>(
-        url: String,
-        retry_policy: P,
-        ping_config: PingConfig,
-    ) -> Result<Self, RpcError>
-    where
-        P: Iterator<Item = Duration> + Send + 'static + Clone,
-    {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let client = Retry::spawn(retry_policy.clone(), || ws_client(&url, ping_config)).await?;
-        let reconnect_cnt = ReconnectCounter::new();
-
-        tokio::spawn(background_task(
-            client,
-            rx,
-            retry_policy,
-            url,
-            reconnect_cnt.clone(),
-            ping_config,
-        ));
-
-        Ok(Self { tx, reconnect_cnt })
+impl Client {
+    pub fn builder() -> ClientBuilder<ExponentialBackoff> {
+        ClientBuilder::new()
     }
 }
 
 #[cfg(feature = "subxt")]
-impl subxt::backend::rpc::RpcClientT for ReconnectingWsClient {
+impl subxt::backend::rpc::RpcClientT for Client {
     fn request_raw<'a>(
         &'a self,
         method: &'a str,
@@ -192,11 +295,18 @@ impl subxt::backend::rpc::RpcClientT for ReconnectingWsClient {
                 .await
                 .map_err(|e| subxt::error::RpcError::ClientError(Box::new(e)))?;
 
-            let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(sub)
+            let id = match sub.id {
+                SubscriptionId::Num(n) => n.to_string(),
+                SubscriptionId::Str(s) => s.to_string(),
+            };
+            let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(sub.stream)
                 .map_err(|e| subxt::error::RpcError::ClientError(Box::new(e)))
                 .boxed();
 
-            Ok(subxt::backend::rpc::RawRpcSubscription { stream, id: None })
+            Ok(subxt::backend::rpc::RawRpcSubscription {
+                stream,
+                id: Some(id),
+            })
         }
         .boxed()
     }
@@ -213,7 +323,7 @@ pub enum Op {
         subscribe_method: String,
         params: RpcParams,
         unsubscribe_method: String,
-        send_back: oneshot::Sender<Result<mpsc::UnboundedReceiver<MethodResult>, RpcError>>,
+        send_back: oneshot::Sender<Result<Subscription, RpcError>>,
     },
 }
 
@@ -231,15 +341,24 @@ pub struct Closed {
     id: usize,
 }
 
-async fn ws_client(url: &str, ping_config: PingConfig) -> Result<Arc<WsClient>, RpcError> {
-    let client = if let PingConfig::Enabled(dur) = ping_config {
-        WsClientBuilder::default()
-            .ping_interval(dur)
-            .build(url)
-            .await?
-    } else {
-        WsClientBuilder::default().build(url).await?
-    };
+async fn ws_client<P>(url: &str, builder: &ClientBuilder<P>) -> Result<Arc<WsClient>, RpcError> {
+    let ClientBuilder {
+        max_request_size,
+        max_response_size,
+        ping_config,
+        ..
+    } = builder;
+
+    let mut ws_client_builder = WsClientBuilder::new()
+        .max_request_size(*max_request_size)
+        .max_response_size(*max_response_size)
+        .max_buffer_capacity_per_subscription(tokio::sync::Semaphore::MAX_PERMITS);
+
+    if let Some(ping) = ping_config {
+        ws_client_builder = ws_client_builder.ping_interval(*ping);
+    }
+
+    let client = ws_client_builder.build(url).await?;
 
     Ok(Arc::new(client))
 }
@@ -297,6 +416,10 @@ async fn dispatch_call(
             {
                 Ok(sub) => {
                     let (tx, rx) = mpsc::unbounded_channel();
+                    let sub_id = match sub.kind() {
+                        SubscriptionKind::Subscription(id) => id.clone().into_owned(),
+                        _ => unreachable!("Not method subscriptions possible in this crate"),
+                    };
 
                     tokio::spawn(subscription_handler(
                         tx.clone(),
@@ -313,8 +436,13 @@ async fn dispatch_call(
                         unsubscribe_method,
                     };
 
+                    let stream = Subscription {
+                        id: sub_id,
+                        stream: rx,
+                    };
+
                     // Fails only if the request is dropped.
-                    let _ = send_back.send(Ok(rx));
+                    let _ = send_back.send(Ok(stream));
                     Ok(Some((id, sub)))
                 }
                 Err(RpcError::RestartNeeded(_)) => Err(Closed {
@@ -339,7 +467,7 @@ async fn dispatch_call(
 /// Sends a message to main task if the subscription was closed without that connection was closed.
 async fn subscription_handler(
     tx: UnboundedSender<MethodResult>,
-    mut sub: Subscription<Box<RawValue>>,
+    mut sub: RpcSubscription<Box<RawValue>>,
     reconnect_cnt: ReconnectCounter,
     sub_closed: mpsc::UnboundedSender<usize>,
     id: usize,
@@ -372,10 +500,9 @@ async fn subscription_handler(
 async fn background_task<P>(
     mut client: Arc<WsClient>,
     mut rx: UnboundedReceiver<Op>,
-    retry_policy: P,
     url: String,
     reconnect_cnt: ReconnectCounter,
-    ping_config: PingConfig,
+    client_builder: ClientBuilder<P>,
 ) where
     P: Iterator<Item = Duration> + Send + 'static + Clone,
 {
@@ -417,13 +544,12 @@ async fn background_task<P>(
                     Some(Err(Closed { op, id })) => {
                         let params = ReconnectParams {
                             url: &url,
-                            ping_config,
                             pending_calls: &mut pending_calls,
                             dispatch: vec![(id, op)],
                             reconnect_cnt: reconnect_cnt.clone(),
-                            retry_policy: retry_policy.clone(),
                             sub_tx: sub_tx.clone(),
-                            open_subscriptions: &open_subscriptions
+                            open_subscriptions: &open_subscriptions,
+                            client_builder: &client_builder,
                         };
                         client = match reconnect(params).await {
                             Ok(client) => client,
@@ -441,13 +567,12 @@ async fn background_task<P>(
             _ = client.on_disconnect() => {
                 let params = ReconnectParams {
                     url: &url,
-                    ping_config,
                     pending_calls: &mut pending_calls,
                     dispatch: vec![],
                     reconnect_cnt: reconnect_cnt.clone(),
-                    retry_policy: retry_policy.clone(),
                     sub_tx: sub_tx.clone(),
-                    open_subscriptions: &open_subscriptions
+                    open_subscriptions: &open_subscriptions,
+                    client_builder: &client_builder,
                 };
 
                client = match reconnect(params).await {
@@ -473,15 +598,14 @@ async fn background_task<P>(
 
 struct ReconnectParams<'a, P> {
     url: &'a str,
-    ping_config: PingConfig,
     pending_calls: &'a mut MaybePendingFutures<
         BoxFuture<'static, Result<Option<(usize, RetrySubscription)>, Closed>>,
     >,
     dispatch: Vec<(usize, Op)>,
     reconnect_cnt: ReconnectCounter,
-    retry_policy: P,
     sub_tx: UnboundedSender<usize>,
     open_subscriptions: &'a HashMap<usize, RetrySubscription>,
+    client_builder: &'a ClientBuilder<P>,
 }
 
 async fn reconnect<P>(params: ReconnectParams<'_, P>) -> Result<Arc<WsClient>, RpcError>
@@ -492,14 +616,15 @@ where
 
     let ReconnectParams {
         url,
-        ping_config,
         pending_calls,
         mut dispatch,
         reconnect_cnt,
-        retry_policy,
         sub_tx,
         open_subscriptions,
+        client_builder,
     } = params;
+
+    let retry_policy = client_builder.retry_policy.clone();
 
     // All futures should return now because the connection has been terminated.
     while !pending_calls.is_empty() {
@@ -512,7 +637,7 @@ where
     }
 
     reconnect_cnt.inc();
-    let client = Retry::spawn(retry_policy.clone(), || ws_client(url, ping_config)).await?;
+    let client = Retry::spawn(retry_policy.clone(), || ws_client(url, &client_builder)).await?;
 
     for (id, op) in dispatch {
         pending_calls.push(
@@ -573,13 +698,7 @@ mod tests {
         init_logger();
         let (_handle, addr) = run_server().await.unwrap();
 
-        let client = ReconnectingWsClient::new(
-            addr,
-            ExponentialBackoff::from_millis(10),
-            PingConfig::Disabled,
-        )
-        .await
-        .unwrap();
+        let client = Client::builder().build(addr).await.unwrap();
 
         assert!(client
             .request("say_hello".to_string(), rpc_params![])
@@ -592,13 +711,11 @@ mod tests {
         init_logger();
         let (_handle, addr) = run_server().await.unwrap();
 
-        let client = ReconnectingWsClient::new(
-            addr,
-            ExponentialBackoff::from_millis(10),
-            PingConfig::Disabled,
-        )
-        .await
-        .unwrap();
+        let client = Client::builder()
+            .retry_policy(ExponentialBackoff::from_millis(50))
+            .build(addr)
+            .await
+            .unwrap();
 
         let mut sub = client
             .subscribe(
@@ -609,21 +726,14 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(sub.recv().await.is_some());
+        assert!(sub.next().await.is_some());
     }
 
     #[tokio::test]
     async fn reconn_sub_works() {
         init_logger();
         let (handle, addr) = run_server().await.unwrap();
-
-        let client = ReconnectingWsClient::new(
-            addr.clone(),
-            ExponentialBackoff::from_millis(10),
-            PingConfig::Disabled,
-        )
-        .await
-        .unwrap();
+        let client = Client::builder().build(addr.clone()).await.unwrap();
 
         let mut sub = client
             .subscribe(
@@ -643,7 +753,7 @@ mod tests {
         // Ensure that the client reconnects and that subscription keep running when
         // the connection is established again.
         for _ in 0..10 {
-            assert!(sub.recv().await.is_some());
+            assert!(sub.next().await.is_some());
         }
 
         assert_eq!(client.retry_count(), 1);
@@ -654,15 +764,7 @@ mod tests {
         init_logger();
         let (handle, addr) = run_server_with_settings(None, true).await.unwrap();
 
-        let client = Arc::new(
-            ReconnectingWsClient::new(
-                addr.clone(),
-                ExponentialBackoff::from_millis(10),
-                PingConfig::Disabled,
-            )
-            .await
-            .unwrap(),
-        );
+        let client = Arc::new(Client::builder().build(addr.clone()).await.unwrap());
 
         let req_fut = client
             .request("say_hello".to_string(), rpc_params![])

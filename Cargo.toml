@@ -7,16 +7,17 @@ edition = "2021"
 
 [dependencies]
 futures = "0.3.29"
-jsonrpsee = { version = "0.20.1", features = ["ws-client"] }
+jsonrpsee = { version = "0.20.3", features = ["ws-client"] }
 serde_json = { version = "1", features = ["raw_value"] }
 tokio = { version = "1.35", features = ["rt-multi-thread", "sync"] }
 tokio-stream = "0.1"
 tokio-retry = "0.3"
 tracing = "0.1"
 
+# optional dependencies
 subxt = { version = "0.33", optional = true }
 
 [dev-dependencies]
-jsonrpsee = { version = "0.20.1", features = ["server"] }
+jsonrpsee = { version = "0.20.3", features = ["server"] }
 anyhow = "1"
 tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
