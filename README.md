@@ -18,5 +18,5 @@ this crate is not recommended.
 let client = Client::builder().build(addr).await.unwrap();
 let mut sub = client
     .subscribe("sub".to_string(), rpc_params![], "unsub".to_string()).await.unwrap();
-let msg = sub.recv().await.unwrap();
+let msg = sub.next().await.unwrap();
 ```
