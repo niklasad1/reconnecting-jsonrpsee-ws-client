@@ -15,11 +15,8 @@ this crate is not recommended.
 ## Example
 
 ```rust
-let client = ReconnectingWsClient::new(
-    "ws://example.com", 
-    ExponentialBackoff::from_millis(10), 
-    PingConfig::Enabled(Duration::from_secs(6))
-).await.unwrap();
-let mut sub = client.subscribe("subscribe_lo".to_string(), rpc_params![], "unsubscribe_lo".to_string()).await.unwrap();
+let client = Client::builder().build(addr).await.unwrap();
+let mut sub = client
+    .subscribe("sub".to_string(), rpc_params![], "unsub".to_string()).await.unwrap();
 let msg = sub.recv().await.unwrap();
 ```
