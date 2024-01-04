@@ -16,7 +16,6 @@ this crate is not recommended.
 
 ```rust
 let client = Client::builder().build(addr).await.unwrap();
-let mut sub = client
-    .subscribe("sub".to_string(), rpc_params![], "unsub".to_string()).await.unwrap();
+let mut sub = client.subscribe("sub".to_string(), rpc_params![], "unsub".to_string()).await.unwrap();
 let msg = sub.next().await.unwrap();
 ```

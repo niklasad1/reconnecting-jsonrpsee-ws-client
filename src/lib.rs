@@ -26,7 +26,9 @@
 //!
 //! ```
 
-pub mod utils;
+#![warn(missing_docs)]
+
+mod utils;
 
 pub use jsonrpsee::types::SubscriptionId;
 pub use tokio_retry::strategy::*;
@@ -34,8 +36,12 @@ pub use tokio_retry::strategy::*;
 use futures::{future::BoxFuture, FutureExt, Stream, StreamExt};
 use jsonrpsee::{
     core::client::{ClientT, Subscription as RpcSubscription, SubscriptionClientT},
-    core::{client::SubscriptionKind, traits::ToRpcParams, Error as RpcError},
-    ws_client::{WsClient, WsClientBuilder},
+    core::{
+        client::{IdKind, SubscriptionKind},
+        traits::ToRpcParams,
+        Error as RpcError,
+    },
+    ws_client::{HeaderMap, WsClient, WsClientBuilder},
 };
 use serde_json::value::RawValue;
 use std::{collections::HashMap, pin::Pin, sync::Arc, task, time::Duration};
@@ -58,6 +64,7 @@ impl ToRpcParams for RpcParams {
     }
 }
 
+/// Represent a single subscription.
 pub struct Subscription {
     id: SubscriptionId<'static>,
     stream: mpsc::UnboundedReceiver<MethodResult>,
@@ -76,6 +83,7 @@ impl Subscription {
         StreamExt::next(self).await
     }
 
+    /// Get the subscription ID.
     pub fn id(&self) -> SubscriptionId<'static> {
         self.id.clone()
     }
@@ -113,6 +121,13 @@ pub struct ClientBuilder<P> {
     max_response_size: u32,
     retry_policy: P,
     ping_config: Option<Duration>,
+    headers: HeaderMap,
+    max_redirections: u32,
+    id_kind: IdKind,
+    max_log_len: u32,
+    max_concurrent_requests: u32,
+    request_timeout: Duration,
+    connection_timeout: Duration,
 }
 
 impl Default for ClientBuilder<ExponentialBackoff> {
@@ -122,11 +137,19 @@ impl Default for ClientBuilder<ExponentialBackoff> {
             max_response_size: 10 * 1024 * 1024,
             retry_policy: ExponentialBackoff::from_millis(10),
             ping_config: Some(Duration::from_secs(30)),
+            headers: HeaderMap::new(),
+            max_redirections: 5,
+            id_kind: IdKind::Number,
+            max_log_len: 1024,
+            max_concurrent_requests: 1024,
+            request_timeout: Duration::from_secs(60),
+            connection_timeout: Duration::from_secs(10),
         }
     }
 }
 
 impl ClientBuilder<ExponentialBackoff> {
+    /// Create a new builder.
     pub fn new() -> Self {
         Self::default()
     }
@@ -137,14 +160,73 @@ where
     P: Iterator<Item = Duration> + Send + Sync + 'static + Clone,
 {
     /// Configure the min response size a for websocket message.
+    ///
+    /// Default: 10MB
     pub fn max_request_size(mut self, max: u32) -> Self {
         self.max_request_size = max;
         self
     }
 
     /// Configure the max response size a for websocket message.
+    ///
+    /// Default: 10MB
     pub fn max_response_size(mut self, max: u32) -> Self {
         self.max_response_size = max;
+        self
+    }
+
+    /// Set the max number of redirections to perform until a connection is regarded as failed.
+    ///
+    /// Default: 5
+    pub fn max_redirections(mut self, redirect: u32) -> Self {
+        self.max_redirections = redirect;
+        self
+    }
+
+    /// Configure how many concurrent method calls are allowed.
+    ///
+    /// Default: 1024
+    pub fn max_concurrent_requests(mut self, max: u32) -> Self {
+        self.max_concurrent_requests = max;
+        self
+    }
+
+    /// Configure how long until a method call is regarded as failed.
+    ///
+    /// Default: 1 minute
+    pub fn request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = timeout;
+        self
+    }
+
+    /// Set connection timeout for the WebSocket handshake
+    ///
+    /// Default: 10 seconds
+    pub fn connection_timeout(mut self, timeout: Duration) -> Self {
+        self.connection_timeout = timeout;
+        self
+    }
+
+    /// Configure the data type of the request object ID
+    ///
+    /// Default: number
+    pub fn id_format(mut self, kind: IdKind) -> Self {
+        self.id_kind = kind;
+        self
+    }
+
+    /// Set maximum length for logging calls and responses.
+    /// Logs bigger than this limit will be truncated.
+    ///
+    /// Default: 1024
+    pub fn set_max_logging_length(mut self, max: u32) -> Self {
+        self.max_log_len = max;
+        self
+    }
+
+    /// Configure custom headers to use in the WebSocket handshake.
+    pub fn set_headers(mut self, headers: HeaderMap) -> Self {
+        self.headers = headers;
         self
     }
 
@@ -157,6 +239,13 @@ where
             max_response_size: self.max_response_size,
             retry_policy,
             ping_config: self.ping_config,
+            headers: self.headers,
+            max_redirections: self.max_redirections,
+            max_log_len: self.max_log_len,
+            id_kind: self.id_kind,
+            max_concurrent_requests: self.max_concurrent_requests,
+            request_timeout: self.request_timeout,
+            connection_timeout: self.connection_timeout,
         }
     }
 
@@ -170,12 +259,13 @@ where
 
     /// Disable WebSocket ping/pongs.
     ///
-    /// Default: disabled.
+    /// Default: 30 seconds.
     pub fn disable_ws_ping(mut self) -> Self {
         self.ping_config = None;
         self
     }
 
+    /// Build and connect to the target.
     pub async fn build(self, url: String) -> Result<Client, RpcError> {
         let (tx, rx) = mpsc::unbounded_channel();
         let client =
@@ -195,6 +285,7 @@ where
 }
 
 impl Client {
+    /// Create a method call.
     pub async fn request<P: ToRpcParams>(
         &self,
         method: String,
@@ -225,6 +316,7 @@ impl Client {
         rp
     }
 
+    /// Create a subscription.
     pub async fn subscribe<P: ToRpcParams>(
         &self,
         subscribe_method: String,
@@ -236,7 +328,7 @@ impl Client {
             .await
     }
 
-    pub async fn inner_subscribe(
+    async fn inner_subscribe(
         &self,
         subscribe_method: String,
         params: RpcParams,
@@ -255,12 +347,14 @@ impl Client {
             .map_err(|_| RpcError::Custom("Client is dropped".to_string()))?
     }
 
+    /// Get how many times the client has reconnected.
     pub fn retry_count(&self) -> usize {
         self.reconnect_cnt.get()
     }
 }
 
 impl Client {
+    /// Create a builder.
     pub fn builder() -> ClientBuilder<ExponentialBackoff> {
         ClientBuilder::new()
     }
@@ -313,7 +407,7 @@ impl subxt::backend::rpc::RpcClientT for Client {
 }
 
 #[derive(Debug)]
-pub enum Op {
+enum Op {
     Call {
         method: String,
         params: RpcParams,
@@ -336,7 +430,7 @@ struct RetrySubscription {
 }
 
 #[derive(Debug)]
-pub struct Closed {
+struct Closed {
     op: Op,
     id: usize,
 }
@@ -346,13 +440,27 @@ async fn ws_client<P>(url: &str, builder: &ClientBuilder<P>) -> Result<Arc<WsCli
         max_request_size,
         max_response_size,
         ping_config,
+        headers,
+        max_redirections,
+        id_kind,
+        max_concurrent_requests,
+        max_log_len,
+        request_timeout,
+        connection_timeout,
         ..
     } = builder;
 
     let mut ws_client_builder = WsClientBuilder::new()
         .max_request_size(*max_request_size)
         .max_response_size(*max_response_size)
-        .max_buffer_capacity_per_subscription(tokio::sync::Semaphore::MAX_PERMITS);
+        .set_headers(headers.clone())
+        .max_redirections(*max_redirections as usize)
+        .max_buffer_capacity_per_subscription(tokio::sync::Semaphore::MAX_PERMITS)
+        .max_concurrent_requests(*max_concurrent_requests as usize)
+        .set_max_logging_length(*max_log_len)
+        .request_timeout(*request_timeout)
+        .connection_timeout(*connection_timeout)
+        .id_format(*id_kind);
 
     if let Some(ping) = ping_config {
         ws_client_builder = ws_client_builder.ping_interval(*ping);
@@ -637,7 +745,7 @@ where
     }
 
     reconnect_cnt.inc();
-    let client = Retry::spawn(retry_policy.clone(), || ws_client(url, &client_builder)).await?;
+    let client = Retry::spawn(retry_policy.clone(), || ws_client(url, client_builder)).await?;
 
     for (id, op) in dispatch {
         pending_calls.push(

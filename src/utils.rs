@@ -1,3 +1,5 @@
+//! Utils.
+
 use futures::{stream::FuturesUnordered, Future, Stream, StreamExt};
 use std::{
     pin::Pin,
