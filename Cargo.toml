@@ -1,7 +1,14 @@
 [package]
 name = "reconnecting-jsonrpsee-ws-client"
+authors = ["Niklas Adolfsson <niklasadolfsson1@gmail.com>"]
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.64.0"
+license = "MIT"
+repository = "https://github.com/niklasad1/reconnecting-jsonrpsee-ws-client"
+documentation = "https://docs.rs/reconnecting-jsonrpsee-ws-client"
+keywords = ["jsonrpc", "json", "websocket"]
+readme = "README.md"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -16,6 +23,10 @@ tracing = "0.1"
 
 # optional dependencies
 subxt = { version = "0.33", optional = true }
+
+[features]
+default = []
+subxt = ["dep:subxt"]
 
 [dev-dependencies]
 jsonrpsee = { version = "0.20.3", features = ["server"] }
