@@ -67,7 +67,7 @@ type SubscriptionResult = Result<Box<RawValue>, DisconnectWillReconnect>;
 /// An opaque error that indicates the subscription
 /// was disconnnected and will automatically reconnect.
 #[derive(Debug, Clone, thiserror::Error)]
-#[error("The client was disconnected and reconnecting.")]
+#[error("The client was disconnected and reconnect initiated.")]
 pub struct DisconnectWillReconnect;
 
 /// Serialized JSON-RPC params.
