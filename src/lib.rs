@@ -30,18 +30,19 @@
 
 mod utils;
 
-pub use jsonrpsee::types::SubscriptionId;
+pub use jsonrpsee::{types::SubscriptionId, ws_client::PingConfig};
 pub use tokio_retry::strategy::*;
 
 const LOG_TARGET: &str = "reconnecting_jsonrpsee_ws_client";
 
 use futures::{future::BoxFuture, FutureExt, Stream, StreamExt};
 use jsonrpsee::{
-    core::client::{ClientT, Subscription as RpcSubscription, SubscriptionClientT},
+    core::client::{
+        ClientT, Error as RpcError, Subscription as RpcSubscription, SubscriptionClientT,
+    },
     core::{
         client::{IdKind, SubscriptionKind},
         traits::ToRpcParams,
-        Error as RpcError,
     },
     ws_client::{HeaderMap, WsClient, WsClientBuilder},
 };
@@ -74,7 +75,7 @@ pub struct DisconnectWillReconnect;
 pub struct RpcParams(Option<Box<RawValue>>);
 
 impl ToRpcParams for RpcParams {
-    fn to_rpc_params(self) -> Result<Option<Box<RawValue>>, RpcError> {
+    fn to_rpc_params(self) -> Result<Option<Box<RawValue>>, serde_json::Error> {
         Ok(self.0)
     }
 }
@@ -139,7 +140,7 @@ pub struct ClientBuilder<P> {
     max_request_size: u32,
     max_response_size: u32,
     retry_policy: P,
-    ping_config: Option<Duration>,
+    ping_config: Option<PingConfig>,
     headers: HeaderMap,
     max_redirections: u32,
     id_kind: IdKind,
@@ -155,7 +156,7 @@ impl Default for ClientBuilder<ExponentialBackoff> {
             max_request_size: 10 * 1024 * 1024,
             max_response_size: 10 * 1024 * 1024,
             retry_policy: ExponentialBackoff::from_millis(10),
-            ping_config: Some(Duration::from_secs(30)),
+            ping_config: Some(PingConfig::new()),
             headers: HeaderMap::new(),
             max_redirections: 5,
             id_kind: IdKind::Number,
@@ -271,8 +272,8 @@ where
     /// Configure the WebSocket ping/pong interval.
     ///
     /// Default: 30 seconds.
-    pub fn ws_ping(mut self, dur: Duration) -> Self {
-        self.ping_config = Some(dur);
+    pub fn enable_ws_ping(mut self, ping_config: PingConfig) -> Self {
+        self.ping_config = Some(ping_config);
         self
     }
 
@@ -481,12 +482,13 @@ async fn ws_client<P>(url: &str, builder: &ClientBuilder<P>) -> Result<Arc<WsCli
         .max_buffer_capacity_per_subscription(tokio::sync::Semaphore::MAX_PERMITS)
         .max_concurrent_requests(*max_concurrent_requests as usize)
         .set_max_logging_length(*max_log_len)
+        .set_tcp_no_delay(true)
         .request_timeout(*request_timeout)
         .connection_timeout(*connection_timeout)
         .id_format(*id_kind);
 
     if let Some(ping) = ping_config {
-        ws_client_builder = ws_client_builder.ping_interval(*ping);
+        ws_client_builder = ws_client_builder.enable_ws_ping(*ping);
     }
 
     let client = ws_client_builder.build(url).await?;
