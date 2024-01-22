@@ -22,7 +22,7 @@
 //!
 //! let client = Client::builder().build(addr).await.unwrap();
 //! let mut sub = client.subscribe("subscribe_lo".to_string(), rpc_params![], "unsubscribe_lo".to_string()).await.unwrap();
-//! let msg = sub.recv().await.unwrap();
+//! let msg = sub.next().await.unwrap();
 //!
 //! ```
 
@@ -32,6 +32,8 @@ mod utils;
 
 pub use jsonrpsee::types::SubscriptionId;
 pub use tokio_retry::strategy::*;
+
+const LOG_TARGET: &str = "reconnecting_jsonrpsee_ws_client";
 
 use futures::{future::BoxFuture, FutureExt, Stream, StreamExt};
 use jsonrpsee::{
@@ -44,15 +46,28 @@ use jsonrpsee::{
     ws_client::{HeaderMap, WsClient, WsClientBuilder},
 };
 use serde_json::value::RawValue;
-use std::{collections::HashMap, pin::Pin, sync::Arc, task, time::Duration};
+use std::{
+    collections::HashMap,
+    pin::Pin,
+    sync::Arc,
+    task::{self, Poll},
+    time::Duration,
+};
 use tokio::sync::{
     mpsc::{self, UnboundedReceiver, UnboundedSender},
     oneshot,
 };
 use tokio_retry::Retry;
-use utils::{MaybePendingFutures, ReconnectCounter};
+use utils::{reconnect_channel, MaybePendingFutures, ReconnectRx, ReconnectTx};
 
 type MethodResult = Result<Box<RawValue>, RpcError>;
+type SubscriptionResult = Result<Box<RawValue>, DisconnectWillReconnect>;
+
+/// An opaque error that indicates the subscription
+/// was disconnnected and will automatically reconnect.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("The client was disconnected and reconnecting.")]
+pub struct DisconnectWillReconnect;
 
 /// Serialized JSON-RPC params.
 #[derive(Debug, Clone)]
@@ -67,7 +82,7 @@ impl ToRpcParams for RpcParams {
 /// Represent a single subscription.
 pub struct Subscription {
     id: SubscriptionId<'static>,
-    stream: mpsc::UnboundedReceiver<MethodResult>,
+    stream: mpsc::UnboundedReceiver<SubscriptionResult>,
 }
 
 impl Subscription {
@@ -79,7 +94,7 @@ impl Subscription {
     /// method (and delegates to that). Import [`StreamExt`] if you'd like
     /// access to other stream combinator methods.
     #[allow(clippy::should_implement_trait)]
-    pub async fn next(&mut self) -> Option<MethodResult> {
+    pub async fn next(&mut self) -> Option<SubscriptionResult> {
         StreamExt::next(self).await
     }
 
@@ -90,13 +105,17 @@ impl Subscription {
 }
 
 impl Stream for Subscription {
-    type Item = MethodResult;
+    type Item = SubscriptionResult;
 
     fn poll_next(
         mut self: Pin<&mut Self>,
         cx: &mut task::Context<'_>,
     ) -> task::Poll<Option<Self::Item>> {
-        self.stream.poll_recv(cx)
+        match self.stream.poll_recv(cx) {
+            Poll::Ready(Some(msg)) => Poll::Ready(Some(msg)),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
@@ -111,7 +130,7 @@ impl std::fmt::Debug for Subscription {
 #[derive(Clone)]
 pub struct Client {
     tx: mpsc::UnboundedSender<Op>,
-    reconnect_cnt: ReconnectCounter,
+    reconnect: ReconnectRx,
 }
 
 /// Builder for [`Client`].
@@ -270,17 +289,14 @@ where
         let (tx, rx) = mpsc::unbounded_channel();
         let client =
             Retry::spawn(self.retry_policy.clone(), || ws_client(url.as_ref(), &self)).await?;
-        let reconnect_cnt = ReconnectCounter::new();
+        let (reconn_tx, reconn_rx) = reconnect_channel();
 
-        tokio::spawn(background_task(
-            client,
-            rx,
-            url,
-            reconnect_cnt.clone(),
-            self,
-        ));
+        tokio::spawn(background_task(client, rx, url, reconn_tx, self));
 
-        Ok(Client { tx, reconnect_cnt })
+        Ok(Client {
+            tx,
+            reconnect: reconn_rx,
+        })
     }
 }
 
@@ -312,7 +328,6 @@ impl Client {
         let rp = rx
             .await
             .map_err(|_| RpcError::Custom("Client is dropped".to_string()))?;
-        tracing::trace!("RPC response: {:?}", rp);
         rp
     }
 
@@ -347,9 +362,17 @@ impl Client {
             .map_err(|_| RpcError::Custom("Client is dropped".to_string()))?
     }
 
+    /// A future that returns once the client reconnects.
+    ///
+    /// This may be called multiple times.
+    pub async fn on_reconnect(&self) {
+        self.reconnect.on_reconnect().await
+    }
+
     /// Get how many times the client has reconnected.
-    pub fn retry_count(&self) -> usize {
-        self.reconnect_cnt.get()
+    ///
+    pub fn reconnect_count(&self) -> usize {
+        self.reconnect.count()
     }
 }
 
@@ -423,7 +446,7 @@ enum Op {
 
 #[derive(Debug)]
 struct RetrySubscription {
-    tx: mpsc::UnboundedSender<MethodResult>,
+    tx: mpsc::UnboundedSender<SubscriptionResult>,
     subscribe_method: String,
     params: RpcParams,
     unsubscribe_method: String,
@@ -475,7 +498,6 @@ async fn dispatch_call(
     client: Arc<WsClient>,
     op: Op,
     id: usize,
-    reconnect_cnt: ReconnectCounter,
     sub_closed: mpsc::UnboundedSender<usize>,
 ) -> Result<Option<(usize, RetrySubscription)>, Closed> {
     match op {
@@ -526,16 +548,10 @@ async fn dispatch_call(
                     let (tx, rx) = mpsc::unbounded_channel();
                     let sub_id = match sub.kind() {
                         SubscriptionKind::Subscription(id) => id.clone().into_owned(),
-                        _ => unreachable!("Not method subscriptions possible in this crate"),
+                        _ => unreachable!("No method subscriptions possible in this crate"),
                     };
 
-                    tokio::spawn(subscription_handler(
-                        tx.clone(),
-                        sub,
-                        reconnect_cnt,
-                        sub_closed,
-                        id,
-                    ));
+                    tokio::spawn(subscription_handler(tx.clone(), sub, sub_closed, id));
 
                     let sub = RetrySubscription {
                         tx,
@@ -574,33 +590,33 @@ async fn dispatch_call(
 
 /// Sends a message to main task if the subscription was closed without that connection was closed.
 async fn subscription_handler(
-    tx: UnboundedSender<MethodResult>,
+    tx: UnboundedSender<SubscriptionResult>,
     mut sub: RpcSubscription<Box<RawValue>>,
-    reconnect_cnt: ReconnectCounter,
     sub_closed: mpsc::UnboundedSender<usize>,
     id: usize,
 ) {
-    let restart_cnt_before = reconnect_cnt.get();
-
     let sub_dropped = loop {
         tokio::select! {
             next_msg = sub.next() => {
                 let Some(notif) = next_msg else {
+                    _ = tx.send(Err(DisconnectWillReconnect));
                     break false;
                 };
 
-                if tx.send(notif).is_err() {
+                let msg = notif.expect("RawValue is valid JSON; qed");
+                if tx.send(Ok(msg)).is_err() {
                     break true;
                 }
             }
-            _ = sub_closed.closed() => break true,
+            _ = sub_closed.closed() => {
+                break true
+            }
         }
     };
 
-    // The subscription was dropped by the user or closed by some reason.
-    //
+    // The subscription was dropped.
     // Thus, the subscription should be removed.
-    if sub_dropped || restart_cnt_before != reconnect_cnt.get() {
+    if sub_dropped {
         let _ = sub_closed.send(id);
     }
 }
@@ -609,7 +625,7 @@ async fn background_task<P>(
     mut client: Arc<WsClient>,
     mut rx: UnboundedReceiver<Op>,
     url: String,
-    reconnect_cnt: ReconnectCounter,
+    reconn: ReconnectTx,
     client_builder: ClientBuilder<P>,
 ) where
     P: Iterator<Item = Duration> + Send + 'static + Clone,
@@ -621,29 +637,26 @@ async fn background_task<P>(
 
     loop {
         tracing::trace!(
+            target: LOG_TARGET,
             "pending_calls={} open_subscriptions={}, client_restarts={}",
             pending_calls.len(),
             open_subscriptions.len(),
-            reconnect_cnt.get(),
+            reconn.count(),
         );
 
         tokio::select! {
             // An incoming JSON-RPC call to dispatch.
             next_message = rx.recv() => {
-                tracing::trace!("next_message: {:?}", next_message);
-
                 match next_message {
                     None => break,
                     Some(op) => {
-                        pending_calls.push(dispatch_call(client.clone(), op, id, reconnect_cnt.clone(), sub_tx.clone()).boxed());
+                        pending_calls.push(dispatch_call(client.clone(), op, id, sub_tx.clone()).boxed());
                     }
                 };
             }
 
             // Handle response.
             next_response = pending_calls.next() => {
-                tracing::trace!("next_response: {:?}", next_response);
-
                 match next_response {
                     Some(Ok(Some((id, sub)))) => {
                         open_subscriptions.insert(id, sub);
@@ -654,7 +667,7 @@ async fn background_task<P>(
                             url: &url,
                             pending_calls: &mut pending_calls,
                             dispatch: vec![(id, op)],
-                            reconnect_cnt: reconnect_cnt.clone(),
+                            reconnect: reconn.clone(),
                             sub_tx: sub_tx.clone(),
                             open_subscriptions: &open_subscriptions,
                             client_builder: &client_builder,
@@ -662,7 +675,7 @@ async fn background_task<P>(
                         client = match reconnect(params).await {
                             Ok(client) => client,
                             Err(e) => {
-                                tracing::error!("Failed to reconnect/re-establish subscriptions: {e}; terminating the connection");
+                                tracing::error!(target: LOG_TARGET, "Failed to reconnect/re-establish subscriptions: {e}; terminating the connection");
                                 break;
                             }
                        };
@@ -677,7 +690,7 @@ async fn background_task<P>(
                     url: &url,
                     pending_calls: &mut pending_calls,
                     dispatch: vec![],
-                    reconnect_cnt: reconnect_cnt.clone(),
+                    reconnect: reconn.clone(),
                     sub_tx: sub_tx.clone(),
                     open_subscriptions: &open_subscriptions,
                     client_builder: &client_builder,
@@ -686,7 +699,7 @@ async fn background_task<P>(
                client = match reconnect(params).await {
                     Ok(client) => client,
                     Err(e) => {
-                        tracing::error!("Failed to reconnect/re-establish subscriptions: {e}; terminating the connection");
+                        tracing::error!(target: LOG_TARGET, "Failed to reconnect/re-establish subscriptions: {e}; terminating the connection");
                         break;
                     }
                };
@@ -710,7 +723,7 @@ struct ReconnectParams<'a, P> {
         BoxFuture<'static, Result<Option<(usize, RetrySubscription)>, Closed>>,
     >,
     dispatch: Vec<(usize, Op)>,
-    reconnect_cnt: ReconnectCounter,
+    reconnect: ReconnectTx,
     sub_tx: UnboundedSender<usize>,
     open_subscriptions: &'a HashMap<usize, RetrySubscription>,
     client_builder: &'a ClientBuilder<P>,
@@ -720,13 +733,13 @@ async fn reconnect<P>(params: ReconnectParams<'_, P>) -> Result<Arc<WsClient>, R
 where
     P: Iterator<Item = Duration> + Send + 'static + Clone,
 {
-    tracing::info!("Connection closed; reconnecting");
+    tracing::debug!(target: LOG_TARGET, "Connection closed; reconnecting");
 
     let ReconnectParams {
         url,
         pending_calls,
         mut dispatch,
-        reconnect_cnt,
+        reconnect,
         sub_tx,
         open_subscriptions,
         client_builder,
@@ -744,20 +757,11 @@ where
         };
     }
 
-    reconnect_cnt.inc();
+    reconnect.reconnect();
     let client = Retry::spawn(retry_policy.clone(), || ws_client(url, client_builder)).await?;
 
     for (id, op) in dispatch {
-        pending_calls.push(
-            dispatch_call(
-                client.clone(),
-                op,
-                id,
-                reconnect_cnt.clone(),
-                sub_tx.clone(),
-            )
-            .boxed(),
-        );
+        pending_calls.push(dispatch_call(client.clone(), op, id, sub_tx.clone()).boxed());
     }
 
     for (id, s) in open_subscriptions.iter() {
@@ -770,13 +774,7 @@ where
         })
         .await?;
 
-        tokio::spawn(subscription_handler(
-            s.tx.clone(),
-            sub,
-            reconnect_cnt.clone(),
-            sub_tx.clone(),
-            *id,
-        ));
+        tokio::spawn(subscription_handler(s.tx.clone(), sub, sub_tx.clone(), *id));
     }
 
     Ok(client)
@@ -858,13 +856,44 @@ mod tests {
         // Restart the server.
         let (_handle, _) = run_server_with_settings(Some(&addr), false).await.unwrap();
 
+        client.on_reconnect().await;
+
         // Ensure that the client reconnects and that subscription keep running when
         // the connection is established again.
         for _ in 0..10 {
             assert!(sub.next().await.is_some());
         }
 
-        assert_eq!(client.retry_count(), 1);
+        assert_eq!(client.reconnect_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn sub_emits_reconn_notif() {
+        init_logger();
+        let (handle, addr) = run_server().await.unwrap();
+        let client = Client::builder().build(addr.clone()).await.unwrap();
+
+        let mut sub = client
+            .subscribe(
+                "subscribe_lo".to_string(),
+                rpc_params![],
+                "unsubscribe_lo".to_string(),
+            )
+            .await
+            .unwrap();
+
+        let _ = handle.stop();
+        handle.stopped().await;
+
+        client.on_reconnect().await;
+
+        assert!(matches!(sub.next().await, Some(Ok(_))));
+        assert!(matches!(
+            sub.next().await,
+            Some(Err(DisconnectWillReconnect))
+        ));
+
+        assert_eq!(client.reconnect_count(), 1);
     }
 
     #[tokio::test]
