@@ -18,7 +18,7 @@
 //! ```no run
 //! use reconnecting_jsonrpsee_ws_client::{ReconnectingWsClient, ExponentialBackoff};
 //!
-//! // Connect to a remote node a retry with exponential backoff.
+//! // Connect to a remote node and reconnect with exponential backoff.
 //!
 //! let client = Client::builder().build(addr).await.unwrap();
 //! let mut sub = client.subscribe("subscribe_lo".to_string(), rpc_params![], "unsubscribe_lo".to_string()).await.unwrap();
@@ -30,16 +30,16 @@
 
 mod utils;
 
-pub use jsonrpsee::{types::SubscriptionId, ws_client::PingConfig};
+pub use jsonrpsee::{
+    core::client::error::Error as RpcError, types::SubscriptionId, ws_client::PingConfig,
+};
 pub use tokio_retry::strategy::*;
 
 const LOG_TARGET: &str = "reconnecting_jsonrpsee_ws_client";
 
 use futures::{future::BoxFuture, FutureExt, Stream, StreamExt};
 use jsonrpsee::{
-    core::client::{
-        ClientT, Error as RpcError, Subscription as RpcSubscription, SubscriptionClientT,
-    },
+    core::client::{ClientT, Subscription as RpcSubscription, SubscriptionClientT},
     core::{
         client::{IdKind, SubscriptionKind},
         traits::ToRpcParams,
@@ -60,6 +60,8 @@ use tokio::sync::{
 };
 use tokio_retry::Retry;
 use utils::{reconnect_channel, MaybePendingFutures, ReconnectRx, ReconnectTx};
+
+use crate::utils::display_close_reason;
 
 type MethodResult = Result<Box<RawValue>, RpcError>;
 type SubscriptionResult = Result<Box<RawValue>, DisconnectWillReconnect>;
@@ -309,10 +311,12 @@ impl Client {
         params: P,
     ) -> Result<Box<RawValue>, RpcError> {
         let params = RpcParams(params.to_rpc_params()?);
-        self.inner_request(method, params).await
+        self.request_raw(method, params).await
     }
 
-    async fn inner_request(
+    /// Similar to [`Client::request`] but doesn't check
+    /// that the params are valid JSON-RPC params.
+    pub async fn request_raw(
         &self,
         method: String,
         params: RpcParams,
@@ -340,11 +344,13 @@ impl Client {
         unsubscribe_method: String,
     ) -> Result<Subscription, RpcError> {
         let params = RpcParams(params.to_rpc_params()?);
-        self.inner_subscribe(subscribe_method, params, unsubscribe_method)
+        self.subscribe_raw(subscribe_method, params, unsubscribe_method)
             .await
     }
 
-    async fn inner_subscribe(
+    /// Similar to [`Client::subscribe`] but doesn't check
+    /// that the params are valid JSON-RPC params.
+    pub async fn subscribe_raw(
         &self,
         subscribe_method: String,
         params: RpcParams,
@@ -392,7 +398,7 @@ impl subxt::backend::rpc::RpcClientT for Client {
         params: Option<Box<RawValue>>,
     ) -> subxt::backend::rpc::RawRpcFuture<'a, Box<serde_json::value::RawValue>> {
         async {
-            self.inner_request(method.to_string(), RpcParams(params))
+            self.request_raw(method.to_string(), RpcParams(params))
                 .await
                 .map_err(|e| subxt::error::RpcError::ClientError(Box::new(e)))
         }
@@ -409,7 +415,7 @@ impl subxt::backend::rpc::RpcClientT for Client {
 
         async {
             let sub = self
-                .inner_subscribe(sub.to_string(), RpcParams(params), unsub.to_string())
+                .subscribe_raw(sub.to_string(), RpcParams(params), unsub.to_string())
                 .await
                 .map_err(|e| subxt::error::RpcError::ClientError(Box::new(e)))?;
 
@@ -673,7 +679,9 @@ async fn background_task<P>(
                             sub_tx: sub_tx.clone(),
                             open_subscriptions: &open_subscriptions,
                             client_builder: &client_builder,
+                            close_reason: client.disconnect_reason().await,
                         };
+
                         client = match reconnect(params).await {
                             Ok(client) => client,
                             Err(e) => {
@@ -681,6 +689,7 @@ async fn background_task<P>(
                                 break;
                             }
                        };
+
                     }
                     _ => (),
                 }
@@ -696,15 +705,16 @@ async fn background_task<P>(
                     sub_tx: sub_tx.clone(),
                     open_subscriptions: &open_subscriptions,
                     client_builder: &client_builder,
+                    close_reason: client.disconnect_reason().await,
                 };
 
-               client = match reconnect(params).await {
+                client = match reconnect(params).await {
                     Ok(client) => client,
                     Err(e) => {
                         tracing::error!(target: LOG_TARGET, "Failed to reconnect/re-establish subscriptions: {e}; terminating the connection");
                         break;
                     }
-               };
+                };
             }
 
             // Subscription was closed
@@ -729,14 +739,13 @@ struct ReconnectParams<'a, P> {
     sub_tx: UnboundedSender<usize>,
     open_subscriptions: &'a HashMap<usize, RetrySubscription>,
     client_builder: &'a ClientBuilder<P>,
+    close_reason: RpcError,
 }
 
 async fn reconnect<P>(params: ReconnectParams<'_, P>) -> Result<Arc<WsClient>, RpcError>
 where
     P: Iterator<Item = Duration> + Send + 'static + Clone,
 {
-    tracing::debug!(target: LOG_TARGET, "Connection closed; reconnecting");
-
     let ReconnectParams {
         url,
         pending_calls,
@@ -745,6 +754,7 @@ where
         sub_tx,
         open_subscriptions,
         client_builder,
+        close_reason,
     } = params;
 
     let retry_policy = client_builder.retry_policy.clone();
@@ -758,6 +768,8 @@ where
             }
         };
     }
+
+    tracing::debug!(target: LOG_TARGET, "Connection was closed: `{}`", display_close_reason(&close_reason));
 
     reconnect.reconnect();
     let client = Retry::spawn(retry_policy.clone(), || ws_client(url, client_builder)).await?;

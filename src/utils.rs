@@ -1,5 +1,6 @@
 //! Utils.
 
+use crate::RpcError;
 use futures::{stream::FuturesUnordered, Future, Stream, StreamExt};
 use std::{
     pin::Pin,
@@ -122,5 +123,12 @@ impl ReconnectRx {
 
     pub fn count(&self) -> usize {
         self.count.get()
+    }
+}
+
+pub fn display_close_reason(err: &RpcError) -> String {
+    match err {
+        RpcError::RestartNeeded(e) => e.to_string(),
+        other => other.to_string(),
     }
 }
