@@ -35,8 +35,7 @@ pub use jsonrpsee::{
 };
 pub use tokio_retry::strategy::*;
 
-const LOG_TARGET: &str = "reconnecting_jsonrpsee_ws_client";
-
+use crate::utils::display_close_reason;
 use futures::{future::BoxFuture, FutureExt, Stream, StreamExt};
 use jsonrpsee::{
     core::client::{ClientT, Subscription as RpcSubscription, SubscriptionClientT},
@@ -61,7 +60,7 @@ use tokio::sync::{
 use tokio_retry::Retry;
 use utils::{reconnect_channel, MaybePendingFutures, ReconnectRx, ReconnectTx};
 
-use crate::utils::display_close_reason;
+const LOG_TARGET: &str = "reconnecting_jsonrpsee_ws_client";
 
 type MethodResult = Result<Box<RawValue>, RpcError>;
 type SubscriptionResult = Result<Box<RawValue>, DisconnectWillReconnect>;
@@ -75,6 +74,13 @@ pub struct DisconnectWillReconnect;
 /// Serialized JSON-RPC params.
 #[derive(Debug, Clone)]
 pub struct RpcParams(Option<Box<RawValue>>);
+
+impl RpcParams {
+    /// Create new [`RpcParams`] from JSON.
+    pub fn new(json: Option<Box<RawValue>>) -> Self {
+        Self(json)
+    }
+}
 
 impl ToRpcParams for RpcParams {
     fn to_rpc_params(self) -> Result<Option<Box<RawValue>>, serde_json::Error> {
