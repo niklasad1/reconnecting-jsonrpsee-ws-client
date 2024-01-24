@@ -12,7 +12,7 @@ a reconnection attempt occurs. It also contains the reason why it
 was closed.
 - Add API to subscribe to reconnections.
 - Expose low-level APIs for subscriptions and requests.
-- Upgrade jsonrpsee to v0.21
+- Upgrade jsonrpsee to v0.21.
 - Rename `Client::retry_count` to `Client::reconnect_count`
 - Minor documentation tweaks.
 
