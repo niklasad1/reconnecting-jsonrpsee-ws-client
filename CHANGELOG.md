@@ -15,6 +15,7 @@ was closed.
 - Upgrade jsonrpsee to v0.21.
 - Rename `Client::retry_count` to `Client::reconnect_count`.
 - Minor documentation tweaks.
+- Modify the WebSocket ping/pong API.
 
 ## [v0.1.0] - 2022-01-04
 
