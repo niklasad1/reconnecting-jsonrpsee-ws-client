@@ -745,7 +745,7 @@ async fn subscription_handler(
         tokio::select! {
             next_msg = rpc_sub.next() => {
                 let Some(notif) = next_msg else {
-                    // This may occur because the subcription was
+                    // This may occur if the subscription was
                     // closed or that subscription couldn't keep
                     // up with the server but because an unbounded buffer is used
                     // in this crate and only reconnections can cause.
