@@ -1,7 +1,7 @@
 [package]
 name = "reconnecting-jsonrpsee-ws-client"
 authors = ["Niklas Adolfsson <niklasadolfsson1@gmail.com>"]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.64.0"
 license = "MIT"
@@ -14,7 +14,7 @@ readme = "README.md"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-futures = "0.3.29"
+futures = "0.3"
 jsonrpsee = { version = "0.21", features = ["ws-client"] }
 serde_json = { version = "1", features = ["raw_value"] }
 tokio = { version = "1.35", features = ["rt-multi-thread", "sync"] }
@@ -24,7 +24,7 @@ tracing = "0.1"
 thiserror = "1"
 
 # optional dependencies
-subxt = { version = "0.33", optional = true }
+subxt = { version = "0.34", optional = true }
 
 [features]
 default = []
@@ -34,10 +34,17 @@ subxt = ["dep:subxt"]
 jsonrpsee = { version = "0.21", features = ["server"] }
 anyhow = "1"
 tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
-subxt = "0.33"
-subxt-signer = "0.33"
+subxt = "0.34"
+subxt-signer = "0.34"
 
 [[example]]
 name = "hello_subxt"
 path = "examples/hello_subxt.rs"
 required-features = ["subxt"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[package.metadata.playground]
+all-features = true
