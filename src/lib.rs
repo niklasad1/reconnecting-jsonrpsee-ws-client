@@ -1,29 +1,46 @@
-//! Wrapper crate over the jsonrpsee ws client
-//! which automatically reconnects under the hood
-//! without that the user has to restart it manually
-//! by re-transmitting pending calls and re-establish subscriptions
-//! that are closed on disconnect.
+//! Wrapper crate over the jsonrpsee ws client, which automatically reconnects
+//! under the hood; without that, the user has to restart it manually by
+//! re-transmitting pending calls and re-establish subscriptions that
+//! were closed when the connection was terminated.
 //!
-//! The retry strategy applies globally for connections, method calls
-//! and subscriptions.
+//! The tricky part is subscription, which may lose a few notifications,
+//! then re-connect where it's not possible to know which ones.
 //!
-//! The tricky part is subscription which may lose a few notifications
-//! when re-connecting where it's not possible to know which ones.
-//!
-//! Lost subscription notifications may be very important to know in some scenarios where
-//! then crate is not recommended.
+//! Lost subscription notifications may be very important to know in some cases,
+//! and then this library is not recommended to use.
 //!
 //! # Examples
 //!
-//! ```no run
-//! use reconnecting_jsonrpsee_ws_client::{ReconnectingWsClient, ExponentialBackoff};
+//! ```rust
+//!    use std::time::Duration;
+//!    use reconnecting_jsonrpsee_ws_client::{Client, ExponentialBackoff, PingConfig, rpc_params};
 //!
-//! // Connect to a remote node and reconnect with exponential backoff.
+//!    async fn run() {
+//!        // Create a new client with with a reconnecting RPC client.
+//!        let client = Client::builder()
+//!             // Reconnect with exponential backoff.
+//!            .retry_policy(ExponentialBackoff::from_millis(100))
+//!            // Send period WebSocket pings/pongs every 6th second and if it's not ACK:ed in 30 seconds
+//!            // then disconnect.
+//!            //
+//!            // This is just a way to ensure that the connection isn't idle if no message is sent that often
+//!            .enable_ws_ping(
+//!                PingConfig::new()
+//!                .ping_interval(Duration::from_secs(6))
+//!                .inactive_limit(Duration::from_secs(30)),
+//!            )
+//!            // There are other configurations as well that can be found here:
+//!            // <https://docs.rs/reconnecting-jsonrpsee-ws-client/latest/reconnecting_jsonrpsee_ws_client/struct.ClientBuilder.html>
+//!            .build("ws://localhost:9944".to_string())
+//!            .await.unwrap();
 //!
-//! let client = Client::builder().build(addr).await.unwrap();
-//! let mut sub = client.subscribe("subscribe_lo".to_string(), rpc_params![], "unsubscribe_lo".to_string()).await.unwrap();
-//! let msg = sub.next().await.unwrap();
+//!        // make a JSON-RPC call
+//!        let json = client.request("say_hello".to_string(), rpc_params![]).await.unwrap();
 //!
+//!        // make JSON-RPC subscription.
+//!        let mut sub = client.subscribe("subscribe_lo".to_string(), rpc_params![], "unsubscribe_lo".to_string()).await.unwrap();
+//!        let notif = sub.next().await.unwrap();
+//!    }
 //! ```
 
 #![warn(missing_docs)]
@@ -31,7 +48,8 @@
 mod utils;
 
 pub use jsonrpsee::{
-    core::client::error::Error as RpcError, types::SubscriptionId, ws_client::PingConfig,
+    core::client::error::Error as RpcError, rpc_params, types::SubscriptionId,
+    ws_client::PingConfig,
 };
 pub use tokio_retry::strategy::*;
 
@@ -62,14 +80,10 @@ use utils::{reconnect_channel, MaybePendingFutures, ReconnectRx, ReconnectTx};
 
 const LOG_TARGET: &str = "reconnecting_jsonrpsee_ws_client";
 
-type MethodResult = Result<Box<RawValue>, RpcError>;
-type SubscriptionResult = Result<Box<RawValue>, DisconnectWillReconnect>;
-
-/// An opaque error that indicates the subscription
-/// was disconnnected and will automatically reconnect.
-#[derive(Debug, Clone, thiserror::Error)]
-#[error("The client was disconnected and reconnect initiated.")]
-pub struct DisconnectWillReconnect;
+/// Method result.
+pub type MethodResult = Result<Box<RawValue>, RpcError>;
+/// Subscription result.
+pub type SubscriptionResult = Result<Box<RawValue>, DisconnectWillReconnect>;
 
 /// Serialized JSON-RPC params.
 #[derive(Debug, Clone)]
@@ -87,6 +101,12 @@ impl ToRpcParams for RpcParams {
         Ok(self.0)
     }
 }
+
+/// An error that indicates the subscription
+/// was disconnnected and will automatically reconnect.
+#[derive(Debug, thiserror::Error)]
+#[error("The client was disconnected `{0}` and reconnect initiated.")]
+pub struct DisconnectWillReconnect(pub RpcError);
 
 /// Represent a single subscription.
 pub struct Subscription {
@@ -316,7 +336,7 @@ impl Client {
         method: String,
         params: P,
     ) -> Result<Box<RawValue>, RpcError> {
-        let params = RpcParams(params.to_rpc_params()?);
+        let params = params.to_rpc_params()?;
         self.request_raw(method, params).await
     }
 
@@ -325,21 +345,19 @@ impl Client {
     pub async fn request_raw(
         &self,
         method: String,
-        params: RpcParams,
+        params: Option<Box<RawValue>>,
     ) -> Result<Box<RawValue>, RpcError> {
         let (tx, rx) = oneshot::channel();
 
         self.tx
             .send(Op::Call {
                 method,
-                params,
+                params: RpcParams::new(params),
                 send_back: tx,
             })
             .map_err(|_| RpcError::Custom("Client is dropped".to_string()))?;
-        let rp = rx
-            .await
-            .map_err(|_| RpcError::Custom("Client is dropped".to_string()))?;
-        rp
+        rx.await
+            .map_err(|_| RpcError::Custom("Client is dropped".to_string()))?
     }
 
     /// Create a subscription.
@@ -349,7 +367,7 @@ impl Client {
         params: P,
         unsubscribe_method: String,
     ) -> Result<Subscription, RpcError> {
-        let params = RpcParams(params.to_rpc_params()?);
+        let params = params.to_rpc_params()?;
         self.subscribe_raw(subscribe_method, params, unsubscribe_method)
             .await
     }
@@ -359,14 +377,14 @@ impl Client {
     pub async fn subscribe_raw(
         &self,
         subscribe_method: String,
-        params: RpcParams,
+        params: Option<Box<RawValue>>,
         unsubscribe_method: String,
     ) -> Result<Subscription, RpcError> {
         let (tx, rx) = oneshot::channel();
         self.tx
             .send(Op::Subscription {
                 subscribe_method,
-                params,
+                params: RpcParams::new(params),
                 unsubscribe_method,
                 send_back: tx,
             })
@@ -375,7 +393,7 @@ impl Client {
             .map_err(|_| RpcError::Custom("Client is dropped".to_string()))?
     }
 
-    /// A future that returns once the client reconnects.
+    /// A future that returns once the client start to reconnect.
     ///
     /// This may be called multiple times.
     pub async fn on_reconnect(&self) {
@@ -383,7 +401,6 @@ impl Client {
     }
 
     /// Get how many times the client has reconnected.
-    ///
     pub fn reconnect_count(&self) -> usize {
         self.reconnect.count()
     }
@@ -404,7 +421,7 @@ impl subxt::backend::rpc::RpcClientT for Client {
         params: Option<Box<RawValue>>,
     ) -> subxt::backend::rpc::RawRpcFuture<'a, Box<serde_json::value::RawValue>> {
         async {
-            self.request_raw(method.to_string(), RpcParams(params))
+            self.request_raw(method.to_string(), params)
                 .await
                 .map_err(|e| subxt::error::RpcError::ClientError(Box::new(e)))
         }
@@ -421,7 +438,7 @@ impl subxt::backend::rpc::RpcClientT for Client {
 
         async {
             let sub = self
-                .subscribe_raw(sub.to_string(), RpcParams(params), unsub.to_string())
+                .subscribe_raw(sub.to_string(), params, unsub.to_string())
                 .await
                 .map_err(|e| subxt::error::RpcError::ClientError(Box::new(e)))?;
 
@@ -508,133 +525,6 @@ async fn ws_client<P>(url: &str, builder: &ClientBuilder<P>) -> Result<Arc<WsCli
     Ok(Arc::new(client))
 }
 
-async fn dispatch_call(
-    client: Arc<WsClient>,
-    op: Op,
-    id: usize,
-    sub_closed: mpsc::UnboundedSender<usize>,
-) -> Result<Option<(usize, RetrySubscription)>, Closed> {
-    match op {
-        Op::Call {
-            method,
-            params,
-            send_back,
-        } => {
-            match client
-                .request::<Box<RawValue>, _>(&method, params.clone())
-                .await
-            {
-                Ok(rp) => {
-                    // Fails only if the request is dropped.
-                    let _ = send_back.send(Ok(rp));
-                    Ok(None)
-                }
-                Err(RpcError::RestartNeeded(_)) => Err(Closed {
-                    op: Op::Call {
-                        method,
-                        params,
-                        send_back,
-                    },
-                    id,
-                }),
-                Err(e) => {
-                    // Fails only if the request is dropped.
-                    let _ = send_back.send(Err(e));
-                    Ok(None)
-                }
-            }
-        }
-        Op::Subscription {
-            subscribe_method,
-            params,
-            unsubscribe_method,
-            send_back,
-        } => {
-            match client
-                .subscribe::<Box<RawValue>, _>(
-                    &subscribe_method,
-                    params.clone(),
-                    &unsubscribe_method,
-                )
-                .await
-            {
-                Ok(sub) => {
-                    let (tx, rx) = mpsc::unbounded_channel();
-                    let sub_id = match sub.kind() {
-                        SubscriptionKind::Subscription(id) => id.clone().into_owned(),
-                        _ => unreachable!("No method subscriptions possible in this crate"),
-                    };
-
-                    tokio::spawn(subscription_handler(tx.clone(), sub, sub_closed, id));
-
-                    let sub = RetrySubscription {
-                        tx,
-                        subscribe_method,
-                        params,
-                        unsubscribe_method,
-                    };
-
-                    let stream = Subscription {
-                        id: sub_id,
-                        stream: rx,
-                    };
-
-                    // Fails only if the request is dropped.
-                    let _ = send_back.send(Ok(stream));
-                    Ok(Some((id, sub)))
-                }
-                Err(RpcError::RestartNeeded(_)) => Err(Closed {
-                    op: Op::Subscription {
-                        subscribe_method,
-                        params,
-                        unsubscribe_method,
-                        send_back,
-                    },
-                    id,
-                }),
-                Err(e) => {
-                    // Fails only if the request is dropped.
-                    let _ = send_back.send(Err(e));
-                    Ok(None)
-                }
-            }
-        }
-    }
-}
-
-/// Sends a message to main task if the subscription was closed without that connection was closed.
-async fn subscription_handler(
-    tx: UnboundedSender<SubscriptionResult>,
-    mut sub: RpcSubscription<Box<RawValue>>,
-    sub_closed: mpsc::UnboundedSender<usize>,
-    id: usize,
-) {
-    let sub_dropped = loop {
-        tokio::select! {
-            next_msg = sub.next() => {
-                let Some(notif) = next_msg else {
-                    _ = tx.send(Err(DisconnectWillReconnect));
-                    break false;
-                };
-
-                let msg = notif.expect("RawValue is valid JSON; qed");
-                if tx.send(Ok(msg)).is_err() {
-                    break true;
-                }
-            }
-            _ = sub_closed.closed() => {
-                break true
-            }
-        }
-    };
-
-    // The subscription was dropped.
-    // Thus, the subscription should be removed.
-    if sub_dropped {
-        let _ = sub_closed.send(id);
-    }
-}
-
 async fn background_task<P>(
     mut client: Arc<WsClient>,
     mut rx: UnboundedReceiver<Op>,
@@ -668,11 +558,11 @@ async fn background_task<P>(
                     }
                 };
             }
-
-            // Handle response.
+            // Reponse to JSON-RPC ready.
             next_response = pending_calls.next() => {
                 match next_response {
-                    Some(Ok(Some((id, sub)))) => {
+                    // New subscription opened.
+                    Some(Ok(DispatchedCall::Subscription { id, sub })) => {
                         open_subscriptions.insert(id, sub);
                     }
                     // The connection was closed, re-connect and try to send all messages again.
@@ -694,10 +584,11 @@ async fn background_task<P>(
                                 tracing::error!(target: LOG_TARGET, "Failed to reconnect/re-establish subscriptions: {e}; terminating the connection");
                                 break;
                             }
-                       };
-
+                        };
                     }
-                    _ => (),
+                    // Method call dispatched.
+                    Some(Ok(DispatchedCall::Done)) => (),
+                    None => break,
                 }
             }
 
@@ -735,11 +626,168 @@ async fn background_task<P>(
     }
 }
 
+/// The outcome of dispatched call
+/// which may be call or a subscription.
+enum DispatchedCall {
+    Done,
+    Subscription { id: usize, sub: RetrySubscription },
+}
+
+async fn dispatch_call(
+    client: Arc<WsClient>,
+    op: Op,
+    id: usize,
+    remove_sub: mpsc::UnboundedSender<usize>,
+) -> Result<DispatchedCall, Closed> {
+    match op {
+        Op::Call {
+            method,
+            params,
+            send_back,
+        } => {
+            match client
+                .request::<Box<RawValue>, _>(&method, params.clone())
+                .await
+            {
+                Ok(rp) => {
+                    // Fails only if the request is dropped.
+                    let _ = send_back.send(Ok(rp));
+                    Ok(DispatchedCall::Done)
+                }
+                Err(RpcError::RestartNeeded(_)) => Err(Closed {
+                    op: Op::Call {
+                        method,
+                        params,
+                        send_back,
+                    },
+                    id,
+                }),
+                Err(e) => {
+                    // Fails only if the request is dropped.
+                    let _ = send_back.send(Err(e));
+                    Ok(DispatchedCall::Done)
+                }
+            }
+        }
+        Op::Subscription {
+            subscribe_method,
+            params,
+            unsubscribe_method,
+            send_back,
+        } => {
+            match client
+                .subscribe::<Box<RawValue>, _>(
+                    &subscribe_method,
+                    params.clone(),
+                    &unsubscribe_method,
+                )
+                .await
+            {
+                Ok(sub) => {
+                    let (tx, rx) = mpsc::unbounded_channel();
+                    let sub_id = match sub.kind() {
+                        SubscriptionKind::Subscription(id) => id.clone().into_owned(),
+                        _ => unreachable!("No method subscriptions possible in this crate"),
+                    };
+
+                    tokio::spawn(subscription_handler(
+                        tx.clone(),
+                        sub,
+                        remove_sub,
+                        id,
+                        client.clone(),
+                    ));
+
+                    let sub = RetrySubscription {
+                        tx,
+                        subscribe_method,
+                        params,
+                        unsubscribe_method,
+                    };
+
+                    let stream = Subscription {
+                        id: sub_id,
+                        stream: rx,
+                    };
+
+                    // Fails only if the request is dropped.
+                    let _ = send_back.send(Ok(stream));
+                    Ok(DispatchedCall::Subscription { id, sub })
+                }
+                Err(RpcError::RestartNeeded(_)) => Err(Closed {
+                    op: Op::Subscription {
+                        subscribe_method,
+                        params,
+                        unsubscribe_method,
+                        send_back,
+                    },
+                    id,
+                }),
+                Err(e) => {
+                    // Fails only if the request is dropped.
+                    let _ = send_back.send(Err(e));
+                    Ok(DispatchedCall::Done)
+                }
+            }
+        }
+    }
+}
+
+/// Handler for each individual subscription.
+async fn subscription_handler(
+    sub_tx: UnboundedSender<SubscriptionResult>,
+    mut rpc_sub: RpcSubscription<Box<RawValue>>,
+    remove_sub: mpsc::UnboundedSender<usize>,
+    id: usize,
+    client: Arc<WsClient>,
+) {
+    let sub_dropped = loop {
+        tokio::select! {
+            next_msg = rpc_sub.next() => {
+                let Some(notif) = next_msg else {
+                    // This may occur because the subcription was
+                    // closed or that subscription couldn't keep
+                    // up with the server but because an unbounded buffer is used
+                    // in this crate and only reconnections can cause.
+                    let close = client.disconnect_reason().await;
+
+                    // The subscription was closed by the user.
+                    if sub_tx.send(Err(DisconnectWillReconnect(close))).is_err() {
+                        break true;
+                    }
+
+                    break false;
+                };
+
+                let msg = notif.expect("RawValue is valid JSON; qed");
+
+                // The subscription was closed by the user.
+                if sub_tx.send(Ok(msg)).is_err() {
+                    break true;
+                }
+            }
+             // This channel indices whether the subscription was closed by user.
+             _ = sub_tx.closed() => {
+                break true
+            }
+            // This channel indices wheter the main task has been closed.
+            // at this point no further messages are processed.
+            _ = remove_sub.closed() => {
+                break true
+            }
+        }
+    };
+
+    // The subscription was dropped.
+    // Thus, the subscription should be removed.
+    if sub_dropped {
+        let _ = remove_sub.send(id);
+    }
+}
+
 struct ReconnectParams<'a, P> {
     url: &'a str,
-    pending_calls: &'a mut MaybePendingFutures<
-        BoxFuture<'static, Result<Option<(usize, RetrySubscription)>, Closed>>,
-    >,
+    pending_calls: &'a mut MaybePendingFutures<BoxFuture<'static, Result<DispatchedCall, Closed>>>,
     dispatch: Vec<(usize, Op)>,
     reconnect: ReconnectTx,
     sub_tx: UnboundedSender<usize>,
@@ -794,7 +842,13 @@ where
         })
         .await?;
 
-        tokio::spawn(subscription_handler(s.tx.clone(), sub, sub_tx.clone(), *id));
+        tokio::spawn(subscription_handler(
+            s.tx.clone(),
+            sub,
+            sub_tx.clone(),
+            *id,
+            client.clone(),
+        ));
     }
 
     Ok(client)
@@ -803,7 +857,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::future::Either;
+    use futures::{
+        future::{self, Either},
+        stream::FuturesUnordered,
+        TryStreamExt,
+    };
     use jsonrpsee::{
         rpc_params,
         server::{Server, ServerHandle},
@@ -910,7 +968,7 @@ mod tests {
         assert!(matches!(sub.next().await, Some(Ok(_))));
         assert!(matches!(
             sub.next().await,
-            Some(Err(DisconnectWillReconnect))
+            Some(Err(DisconnectWillReconnect(_)))
         ));
 
         assert_eq!(client.reconnect_count(), 1);
@@ -941,6 +999,34 @@ mod tests {
         let (_handle, _) = run_server_with_settings(Some(&addr), false).await.unwrap();
 
         assert!(req_fut.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn reconn_once_when_offline() {
+        init_logger();
+        let (handle, addr) = run_server_with_settings(None, true).await.unwrap();
+        let client = Arc::new(Client::builder().build(addr.clone()).await.unwrap());
+
+        let _ = handle.stop();
+        handle.stopped().await;
+
+        let client2 = client.clone();
+        let reqs = tokio::spawn(async move {
+            let futs: FuturesUnordered<_> = (0..10)
+                .map(|_| client2.request("say_hello".to_string(), rpc_params![]))
+                .collect();
+
+            futs.try_for_each(|_| future::ready(Ok(())))
+                .await
+                .expect("Requests should be succesful");
+        });
+
+        // Restart the server and allow the call to complete.
+        let (_handle, _) = run_server_with_settings(Some(&addr), false).await.unwrap();
+
+        reqs.await.unwrap();
+
+        assert_eq!(client.reconnect_count(), 1);
     }
 
     async fn run_server() -> anyhow::Result<(ServerHandle, String)> {
