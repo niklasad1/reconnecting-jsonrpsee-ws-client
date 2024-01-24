@@ -748,7 +748,7 @@ async fn subscription_handler(
                     // This may occur if the subscription was
                     // closed or that subscription couldn't keep
                     // up with the server but because an unbounded buffer is used
-                    // in this crate and only reconnections can cause.
+                    // in this crate and only re-connections can cause this.
                     let close = client.disconnect_reason().await;
 
                     // The subscription was closed by the user.
