@@ -24,7 +24,7 @@ tracing = "0.1"
 thiserror = "1"
 
 # optional dependencies
-subxt = { version = "0.33", optional = true }
+subxt = { version = "0.34", optional = true }
 
 [features]
 default = []
@@ -34,7 +34,7 @@ subxt = ["dep:subxt"]
 jsonrpsee = { version = "0.21", features = ["server"] }
 anyhow = "1"
 tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
-subxt = "0.33"
+subxt = "0.34"
 subxt-signer = "0.33"
 
 [[example]]
