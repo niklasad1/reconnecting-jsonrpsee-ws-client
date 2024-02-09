@@ -5,8 +5,8 @@ under the hood; without that, the user has to restart it manually by
 re-transmitting pending calls and re-establish subscriptions that
 were closed when the connection was terminated.
 
-The tricky part is subscription, which may lose a few notifications,
-then re-connect where it's not possible to know which ones.
+The tricky part is subscriptions, which may lose a few notifications
+when it's re-connecting where it's not possible to know which ones.
 
 Lost subscription notifications may be very important to know in some cases,
 and then this library is not recommended to use.
