@@ -860,7 +860,7 @@ mod tests {
         let (_handle, addr) = run_server().await.unwrap();
 
         let client = Client::builder()
-            .retry_policy(ExponentialBackoff::from_millis(50))
+            .retry_policy(RetryPolicy::exponential(Duration::from_millis(50)))
             .build(addr)
             .await
             .unwrap();

@@ -36,7 +36,7 @@ native = [
     "jsonrpsee/ws-client",
     "again/default",
 ]
-subxt = ["dep:subxt"]
+subxt = ["dep:subxt", "native"]
 web = [
     "jsonrpsee/jsonrpsee-types",
     "jsonrpsee/async-wasm-client",
