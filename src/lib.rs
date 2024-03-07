@@ -42,14 +42,13 @@
 //!        let notif = sub.next().await.unwrap();
 //!    }
 //! ```
-
 #![warn(missing_docs)]
 
+mod platform;
 mod utils;
 
 pub use jsonrpsee::{
     core::client::error::Error as RpcError, rpc_params, types::SubscriptionId,
-    ws_client::PingConfig,
 };
 pub use tokio_retry::strategy::*;
 
@@ -58,10 +57,9 @@ use futures::{future::BoxFuture, FutureExt, Stream, StreamExt};
 use jsonrpsee::{
     core::client::{ClientT, Subscription as RpcSubscription, SubscriptionClientT},
     core::{
-        client::{IdKind, SubscriptionKind},
+        client::{IdKind, SubscriptionKind, Client as WsClient},
         traits::ToRpcParams,
     },
-    ws_client::{HeaderMap, WsClient, WsClientBuilder},
 };
 use serde_json::value::RawValue;
 use std::{
@@ -71,6 +69,9 @@ use std::{
     task::{self, Poll},
     time::Duration,
 };
+#[cfg(not(feature = "web"))]
+use jsonrpsee::client_transport::ws::HeaderMap;
+use jsonrpsee::core::client::async_client::PingConfig;
 use tokio::sync::{
     mpsc::{self, UnboundedReceiver, UnboundedSender},
     oneshot,
@@ -169,6 +170,9 @@ pub struct ClientBuilder<P> {
     max_response_size: u32,
     retry_policy: P,
     ping_config: Option<PingConfig>,
+    #[cfg(not(feature = "web"))]
+    // web doesn't support custom headers
+    // https://stackoverflow.com/a/4361358/6394734
     headers: HeaderMap,
     max_redirections: u32,
     id_kind: IdKind,
@@ -185,6 +189,7 @@ impl Default for ClientBuilder<ExponentialBackoff> {
             max_response_size: 10 * 1024 * 1024,
             retry_policy: ExponentialBackoff::from_millis(10),
             ping_config: Some(PingConfig::new()),
+            #[cfg(not(feature = "web"))]
             headers: HeaderMap::new(),
             max_redirections: 5,
             id_kind: IdKind::Number,
@@ -272,6 +277,7 @@ where
         self
     }
 
+    #[cfg(not(feature = "web"))]
     /// Configure custom headers to use in the WebSocket handshake.
     pub fn set_headers(mut self, headers: HeaderMap) -> Self {
         self.headers = headers;
@@ -287,6 +293,7 @@ where
             max_response_size: self.max_response_size,
             retry_policy,
             ping_config: self.ping_config,
+            #[cfg(not(feature = "web"))]
             headers: self.headers,
             max_redirections: self.max_redirections,
             max_log_len: self.max_log_len,
@@ -317,10 +324,10 @@ where
     pub async fn build(self, url: String) -> Result<Client, RpcError> {
         let (tx, rx) = mpsc::unbounded_channel();
         let client =
-            Retry::spawn(self.retry_policy.clone(), || ws_client(url.as_ref(), &self)).await?;
+            Retry::spawn(self.retry_policy.clone(), || platform::ws_client(url.as_ref(), &self)).await?;
         let (reconn_tx, reconn_rx) = reconnect_channel();
 
-        tokio::spawn(background_task(client, rx, url, reconn_tx, self));
+        platform::spawn(background_task(client, rx, url, reconn_tx, self));
 
         Ok(Client {
             tx,
@@ -488,42 +495,6 @@ struct Closed {
     id: usize,
 }
 
-async fn ws_client<P>(url: &str, builder: &ClientBuilder<P>) -> Result<Arc<WsClient>, RpcError> {
-    let ClientBuilder {
-        max_request_size,
-        max_response_size,
-        ping_config,
-        headers,
-        max_redirections,
-        id_kind,
-        max_concurrent_requests,
-        max_log_len,
-        request_timeout,
-        connection_timeout,
-        ..
-    } = builder;
-
-    let mut ws_client_builder = WsClientBuilder::new()
-        .max_request_size(*max_request_size)
-        .max_response_size(*max_response_size)
-        .set_headers(headers.clone())
-        .max_redirections(*max_redirections as usize)
-        .max_buffer_capacity_per_subscription(tokio::sync::Semaphore::MAX_PERMITS)
-        .max_concurrent_requests(*max_concurrent_requests as usize)
-        .set_max_logging_length(*max_log_len)
-        .set_tcp_no_delay(true)
-        .request_timeout(*request_timeout)
-        .connection_timeout(*connection_timeout)
-        .id_format(*id_kind);
-
-    if let Some(ping) = ping_config {
-        ws_client_builder = ws_client_builder.enable_ws_ping(*ping);
-    }
-
-    let client = ws_client_builder.build(url).await?;
-
-    Ok(Arc::new(client))
-}
 
 async fn background_task<P>(
     mut client: Arc<WsClient>,
@@ -690,7 +661,7 @@ async fn dispatch_call(
                         _ => unreachable!("No method subscriptions possible in this crate"),
                     };
 
-                    tokio::spawn(subscription_handler(
+                    platform::spawn(subscription_handler(
                         tx.clone(),
                         sub,
                         remove_sub,
@@ -826,7 +797,7 @@ where
     tracing::debug!(target: LOG_TARGET, "Connection was closed: `{}`", display_close_reason(&close_reason));
 
     reconnect.reconnect();
-    let client = Retry::spawn(retry_policy.clone(), || ws_client(url, client_builder)).await?;
+    let client = Retry::spawn(retry_policy.clone(), || platform::ws_client(url, client_builder)).await?;
 
     for (id, op) in dispatch {
         pending_calls.push(dispatch_call(client.clone(), op, id, sub_tx.clone()).boxed());
@@ -842,7 +813,7 @@ where
         })
         .await?;
 
-        tokio::spawn(subscription_handler(
+        platform::spawn(subscription_handler(
             s.tx.clone(),
             sub,
             sub_tx.clone(),
