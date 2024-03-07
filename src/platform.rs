@@ -2,26 +2,14 @@ use crate::{ClientBuilder, RpcError};
 use jsonrpsee::core::client::Client;
 use std::sync::Arc;
 
-#[cfg(feature = "native")]
+#[cfg(all(feature = "native", not(feature = "web")))]
 pub use tokio::spawn;
 
-#[cfg(feature = "web")]
+#[cfg(all(feature = "web", target_arch = "wasm32"))]
 pub use wasm_bindgen_futures::spawn_local as spawn;
 
-#[cfg(feature = "native")]
-pub mod retry {
-    pub use native_tokio_retry::strategy::*;
-    pub use native_tokio_retry::Retry;
-}
-
-#[cfg(feature = "web")]
-pub mod retry {
-    pub use wasm_tokio_retry::strategy::*;
-    pub use wasm_tokio_retry::Retry;
-}
-
-#[cfg(feature = "native")]
-pub async fn ws_client<P>(url: &str, builder: &ClientBuilder<P>) -> Result<Arc<Client>, RpcError> {
+#[cfg(all(feature = "native", not(feature = "web")))]
+pub async fn ws_client(url: &str, builder: &ClientBuilder) -> Result<Arc<Client>, RpcError> {
     use jsonrpsee::ws_client::WsClientBuilder;
 
     let ClientBuilder {
@@ -60,8 +48,8 @@ pub async fn ws_client<P>(url: &str, builder: &ClientBuilder<P>) -> Result<Arc<C
     Ok(Arc::new(client))
 }
 
-#[cfg(feature = "web")]
-pub async fn ws_client<P>(url: &str, builder: &ClientBuilder<P>) -> Result<Arc<Client>, RpcError> {
+#[cfg(all(feature = "web", target_arch = "wasm32"))]
+pub async fn ws_client(url: &str, builder: &ClientBuilder) -> Result<Arc<Client>, RpcError> {
     use jsonrpsee::client_transport::web;
     use jsonrpsee::core::client::ClientBuilder as RpseeClientBuilder;
 
