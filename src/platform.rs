@@ -1,14 +1,26 @@
-use std::sync::Arc;
+use crate::{ClientBuilder, RpcError};
 use jsonrpsee::core::client::Client;
+use std::sync::Arc;
 
-#[cfg(not(feature = "web"))]
+#[cfg(feature = "native")]
 pub use tokio::spawn;
 
 #[cfg(feature = "web")]
 pub use wasm_bindgen_futures::spawn_local as spawn;
-use crate::{ClientBuilder, RpcError};
 
-#[cfg(not(feature = "web"))]
+#[cfg(feature = "native")]
+pub mod retry {
+    pub use native_tokio_retry::strategy::*;
+    pub use native_tokio_retry::Retry;
+}
+
+#[cfg(feature = "web")]
+pub mod retry {
+    pub use wasm_tokio_retry::strategy::*;
+    pub use wasm_tokio_retry::Retry;
+}
+
+#[cfg(feature = "native")]
 pub async fn ws_client<P>(url: &str, builder: &ClientBuilder<P>) -> Result<Arc<Client>, RpcError> {
     use jsonrpsee::ws_client::WsClientBuilder;
 
@@ -62,7 +74,9 @@ pub async fn ws_client<P>(url: &str, builder: &ClientBuilder<P>) -> Result<Arc<C
         ..
     } = builder;
 
-    let (tx, rx) = web::connect(url).await.map_err(|e| RpcError::Transport(e.into()))?;
+    let (tx, rx) = web::connect(url)
+        .await
+        .map_err(|e| RpcError::Transport(e.into()))?;
 
     let mut ws_client_builder = RpseeClientBuilder::new()
         .max_buffer_capacity_per_subscription(tokio::sync::Semaphore::MAX_PERMITS)

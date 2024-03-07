@@ -47,19 +47,22 @@
 mod platform;
 mod utils;
 
-pub use jsonrpsee::{
-    core::client::error::Error as RpcError, rpc_params, types::SubscriptionId,
-};
-pub use tokio_retry::strategy::*;
+use platform::retry::*;
 
 use crate::utils::display_close_reason;
 use futures::{future::BoxFuture, FutureExt, Stream, StreamExt};
+#[cfg(feature = "native")]
+use jsonrpsee::ws_client::HeaderMap;
 use jsonrpsee::{
-    core::client::{ClientT, Subscription as RpcSubscription, SubscriptionClientT},
+    core::client::{
+        async_client::PingConfig, error::Error as RpcError, ClientT,
+        Subscription as RpcSubscription, SubscriptionClientT,
+    },
     core::{
-        client::{IdKind, SubscriptionKind, Client as WsClient},
+        client::{Client as WsClient, IdKind, SubscriptionKind},
         traits::ToRpcParams,
     },
+    types::SubscriptionId,
 };
 use serde_json::value::RawValue;
 use std::{
@@ -69,14 +72,10 @@ use std::{
     task::{self, Poll},
     time::Duration,
 };
-#[cfg(not(feature = "web"))]
-use jsonrpsee::client_transport::ws::HeaderMap;
-use jsonrpsee::core::client::async_client::PingConfig;
 use tokio::sync::{
     mpsc::{self, UnboundedReceiver, UnboundedSender},
     oneshot,
 };
-use tokio_retry::Retry;
 use utils::{reconnect_channel, MaybePendingFutures, ReconnectRx, ReconnectTx};
 
 const LOG_TARGET: &str = "reconnecting_jsonrpsee_ws_client";
@@ -170,7 +169,7 @@ pub struct ClientBuilder<P> {
     max_response_size: u32,
     retry_policy: P,
     ping_config: Option<PingConfig>,
-    #[cfg(not(feature = "web"))]
+    #[cfg(feature = "native")]
     // web doesn't support custom headers
     // https://stackoverflow.com/a/4361358/6394734
     headers: HeaderMap,
@@ -189,7 +188,7 @@ impl Default for ClientBuilder<ExponentialBackoff> {
             max_response_size: 10 * 1024 * 1024,
             retry_policy: ExponentialBackoff::from_millis(10),
             ping_config: Some(PingConfig::new()),
-            #[cfg(not(feature = "web"))]
+            #[cfg(feature = "native")]
             headers: HeaderMap::new(),
             max_redirections: 5,
             id_kind: IdKind::Number,
@@ -277,7 +276,7 @@ where
         self
     }
 
-    #[cfg(not(feature = "web"))]
+    #[cfg(feature = "native")]
     /// Configure custom headers to use in the WebSocket handshake.
     pub fn set_headers(mut self, headers: HeaderMap) -> Self {
         self.headers = headers;
@@ -293,7 +292,7 @@ where
             max_response_size: self.max_response_size,
             retry_policy,
             ping_config: self.ping_config,
-            #[cfg(not(feature = "web"))]
+            #[cfg(feature = "native")]
             headers: self.headers,
             max_redirections: self.max_redirections,
             max_log_len: self.max_log_len,
@@ -323,8 +322,10 @@ where
     /// Build and connect to the target.
     pub async fn build(self, url: String) -> Result<Client, RpcError> {
         let (tx, rx) = mpsc::unbounded_channel();
-        let client =
-            Retry::spawn(self.retry_policy.clone(), || platform::ws_client(url.as_ref(), &self)).await?;
+        let client = Retry::spawn(self.retry_policy.clone(), || {
+            platform::ws_client(url.as_ref(), &self)
+        })
+        .await?;
         let (reconn_tx, reconn_rx) = reconnect_channel();
 
         platform::spawn(background_task(client, rx, url, reconn_tx, self));
@@ -494,7 +495,6 @@ struct Closed {
     op: Op,
     id: usize,
 }
-
 
 async fn background_task<P>(
     mut client: Arc<WsClient>,
@@ -797,7 +797,10 @@ where
     tracing::debug!(target: LOG_TARGET, "Connection was closed: `{}`", display_close_reason(&close_reason));
 
     reconnect.reconnect();
-    let client = Retry::spawn(retry_policy.clone(), || platform::ws_client(url, client_builder)).await?;
+    let client = Retry::spawn(retry_policy.clone(), || {
+        platform::ws_client(url, client_builder)
+    })
+    .await?;
 
     for (id, op) in dispatch {
         pending_calls.push(dispatch_call(client.clone(), op, id, sub_tx.clone()).boxed());
