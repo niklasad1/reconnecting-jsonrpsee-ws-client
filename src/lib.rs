@@ -13,13 +13,13 @@
 //!
 //! ```rust
 //!    use std::time::Duration;
-//!    use reconnecting_jsonrpsee_ws_client::{Client, ExponentialBackoff, PingConfig, rpc_params};
+//!    use reconnecting_jsonrpsee_ws_client::{Client, RetryPolicy, PingConfig, rpc_params};
 //!
 //!    async fn run() {
 //!        // Create a new client with with a reconnecting RPC client.
 //!        let client = Client::builder()
 //!             // Reconnect with exponential backoff.
-//!            .retry_policy(ExponentialBackoff::from_millis(100))
+//!            .retry_policy(RetryPolicy::exponential(Duration::from_millis(100)))
 //!            // Send period WebSocket pings/pongs every 6th second and if it's not ACK:ed in 30 seconds
 //!            // then disconnect.
 //!            //
@@ -44,19 +44,21 @@
 //! ```
 #![warn(missing_docs)]
 
+#[cfg(any(
+    all(feature = "web", feature = "native"),
+    not(any(feature = "web", feature = "native"))
+))]
+compile_error!(
+    "reconnecting-jsonrpsee-client: exactly one of the 'web' and 'native' features should be used."
+);
+
 mod platform;
 mod utils;
 
 use crate::utils::display_close_reason;
-use again::RetryPolicy;
 use futures::{future::BoxFuture, FutureExt, Stream, StreamExt};
 #[cfg(all(feature = "native", not(feature = "web")))]
 use jsonrpsee::ws_client::HeaderMap;
-pub use jsonrpsee::{
-    core::client::{async_client::PingConfig, error::Error as RpcError},
-    rpc_params,
-    types::SubscriptionId,
-};
 use jsonrpsee::{
     core::client::{ClientT, Subscription as RpcSubscription, SubscriptionClientT},
     core::{
@@ -77,6 +79,14 @@ use tokio::sync::{
     oneshot,
 };
 use utils::{reconnect_channel, MaybePendingFutures, ReconnectRx, ReconnectTx};
+
+// re-exports
+pub use again::RetryPolicy;
+pub use jsonrpsee::{
+    core::client::{async_client::PingConfig, error::Error as RpcError},
+    rpc_params,
+    types::SubscriptionId,
+};
 
 const LOG_TARGET: &str = "reconnecting_jsonrpsee_ws_client";
 

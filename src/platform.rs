@@ -5,7 +5,7 @@ use std::sync::Arc;
 #[cfg(all(feature = "native", not(feature = "web")))]
 pub use tokio::spawn;
 
-#[cfg(all(feature = "web", target_arch = "wasm32"))]
+#[cfg(all(feature = "web", target_arch = "wasm32", not(feature = "native")))]
 pub use wasm_bindgen_futures::spawn_local as spawn;
 
 #[cfg(all(feature = "native", not(feature = "web")))]
@@ -48,7 +48,7 @@ pub async fn ws_client(url: &str, builder: &ClientBuilder) -> Result<Arc<Client>
     Ok(Arc::new(client))
 }
 
-#[cfg(all(feature = "web", target_arch = "wasm32"))]
+#[cfg(all(feature = "web", target_arch = "wasm32", not(feature = "native")))]
 pub async fn ws_client(url: &str, builder: &ClientBuilder) -> Result<Arc<Client>, RpcError> {
     use jsonrpsee::client_transport::web;
     use jsonrpsee::core::client::ClientBuilder as RpseeClientBuilder;
