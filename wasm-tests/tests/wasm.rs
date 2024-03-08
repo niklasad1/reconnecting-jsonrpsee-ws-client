@@ -16,15 +16,17 @@ fn init_tracing() {
 async fn rpc_method_call_works() {
     init_tracing();
 
+    tracing::info!("Hello from wasm");
+
     let client = Client::builder()
-        .build("wss://echo.websocket.org/.ws".to_string())
+        .build("wss://rpc.ibp.network/polkadot:443".to_string())
         .await
         .unwrap();
 
     let rp = client
-        .request("echo".to_string(), rpc_params![])
+        .request("chain_getBlockHash".to_string(), rpc_params![19813270])
         .await
         .unwrap();
 
-    assert_eq!("echo", rp.get());
+    assert_eq!("\"0x2990792596bea3bd5e65a868e9510f890cd66cf0002023eb6621b9c0afe930cb\"", rp.get());
 }
