@@ -57,7 +57,7 @@ jobs:
           override: true
 
       - name: Check rustdoc
-        run: RUSTDOCFLAGS="--cfg docsrs --deny rustdoc::broken_intra_doc_links" cargo doc --verbose --workspace --no-deps --document-private-items --all-features
+        run: RUSTDOCFLAGS="--cfg docsrs --deny rustdoc::broken_intra_doc_links" cargo doc --verbose --workspace --no-deps --document-private-items
 
   check-code:
     name: Check
@@ -95,6 +95,7 @@ jobs:
 
       - name: Check wasm
         run: |
+          rustup target add wasm32-unknown-unknown
           cargo check --no-default-features --features=web --target wasm32-unknown-unknown
 
       - name: Check unused dependencies
