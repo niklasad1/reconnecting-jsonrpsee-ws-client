@@ -16,8 +16,6 @@ fn init_tracing() {
 async fn rpc_method_call_works() {
     init_tracing();
 
-    tracing::info!("Hello from wasm");
-
     let client = Client::builder()
         .build("wss://rpc.ibp.network/polkadot:443".to_string())
         .await
@@ -28,5 +26,27 @@ async fn rpc_method_call_works() {
         .await
         .unwrap();
 
-    assert_eq!("\"0x2990792596bea3bd5e65a868e9510f890cd66cf0002023eb6621b9c0afe930cb\"", rp.get());
+    assert_eq!(
+        "\"0x2990792596bea3bd5e65a868e9510f890cd66cf0002023eb6621b9c0afe930cb\"",
+        rp.get()
+    );
+}
+
+#[wasm_bindgen_test]
+async fn rpc_subscription_works() {
+    let client = Client::builder()
+        .build("wss://rpc.ibp.network/polkadot:443".to_string())
+        .await
+        .unwrap();
+
+    let mut sub = client
+        .subscribe(
+            "chain_subscribeNewHeads".to_string(),
+            rpc_params![],
+            "chain_unsubscribeNewHeads".to_string(),
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(sub.next().await, Some(Ok(_))));
 }
