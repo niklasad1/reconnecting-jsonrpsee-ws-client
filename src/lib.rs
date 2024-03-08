@@ -784,7 +784,7 @@ async fn reconnect(params: ReconnectParams<'_>) -> Result<Arc<WsClient>, RpcErro
         };
     }
 
-    tracing::debug!(target: LOG_TARGET, "Connection was closed: `{}`", display_close_reason(&close_reason));
+    tracing::debug!(target: LOG_TARGET, "Connection to {url} was closed: `{}`", display_close_reason(&close_reason));
 
     reconnect.reconnect();
     let client = retry_policy
