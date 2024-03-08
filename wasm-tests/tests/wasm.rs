@@ -16,6 +16,8 @@ fn init_tracing() {
 async fn rpc_method_call_works() {
     init_tracing();
 
+    tracing::info!("Hello from wasm");
+
     let client = Client::builder()
         .build("wss://echo.websocket.org/.ws".to_string())
         .await

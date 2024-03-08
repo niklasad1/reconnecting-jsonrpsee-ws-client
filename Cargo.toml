@@ -19,7 +19,7 @@ tokio = { version = "1.35", features = ["sync"], default-features = false }
 tokio-stream = { version = "0.1", default-features = false }
 tracing = { version = "0.1", default-features = false }
 thiserror = "1"
-again = { git = "https://github.com/softprops/again", branch = "develop", default-features = false }
+again = { git = "https://github.com/polytope-labs/again", branch = "develop", default-features = false }
 
 # optional dependencies
 getrandom = { version = "0.2.12", default-features = false, optional = true }
