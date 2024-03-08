@@ -54,7 +54,6 @@ pub async fn ws_client(url: &str, builder: &ClientBuilder) -> Result<Arc<Client>
     use jsonrpsee::core::client::ClientBuilder as RpseeClientBuilder;
 
     let ClientBuilder {
-        ping_config,
         id_kind,
         max_concurrent_requests,
         max_log_len,
@@ -66,17 +65,13 @@ pub async fn ws_client(url: &str, builder: &ClientBuilder) -> Result<Arc<Client>
         .await
         .map_err(|e| RpcError::Transport(e.into()))?;
 
-    let mut ws_client_builder = RpseeClientBuilder::new()
+    let ws_client_builder = RpseeClientBuilder::new()
         .max_buffer_capacity_per_subscription(tokio::sync::Semaphore::MAX_PERMITS)
         .max_concurrent_requests(*max_concurrent_requests as usize)
         .set_max_logging_length(*max_log_len)
         .set_tcp_no_delay(true)
         .request_timeout(*request_timeout)
         .id_format(*id_kind);
-
-    if let Some(ping) = ping_config {
-        ws_client_builder = ws_client_builder.enable_ws_ping(*ping);
-    }
 
     let client = ws_client_builder.build_with_wasm(tx, rx);
 

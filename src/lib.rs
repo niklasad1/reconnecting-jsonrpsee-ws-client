@@ -82,11 +82,9 @@ use utils::{reconnect_channel, MaybePendingFutures, ReconnectRx, ReconnectTx};
 
 // re-exports
 pub use again::RetryPolicy;
-pub use jsonrpsee::{
-    core::client::{async_client::PingConfig, error::Error as RpcError},
-    rpc_params,
-    types::SubscriptionId,
-};
+#[cfg(all(feature = "native", not(feature = "web")))]
+pub use jsonrpsee::core::client::async_client::PingConfig;
+pub use jsonrpsee::{core::client::error::Error as RpcError, rpc_params, types::SubscriptionId};
 
 const LOG_TARGET: &str = "reconnecting_jsonrpsee_ws_client";
 
@@ -178,6 +176,7 @@ pub struct ClientBuilder {
     max_request_size: u32,
     max_response_size: u32,
     retry_policy: RetryPolicy,
+    #[cfg(all(feature = "native", not(feature = "web")))]
     ping_config: Option<PingConfig>,
     #[cfg(all(feature = "native", not(feature = "web")))]
     // web doesn't support custom headers
@@ -197,6 +196,7 @@ impl Default for ClientBuilder {
             max_request_size: 10 * 1024 * 1024,
             max_response_size: 10 * 1024 * 1024,
             retry_policy: RetryPolicy::exponential(Duration::from_millis(10)),
+            #[cfg(all(feature = "native", not(feature = "web")))]
             ping_config: Some(PingConfig::new()),
             #[cfg(all(feature = "native", not(feature = "web")))]
             headers: HeaderMap::new(),
@@ -298,6 +298,7 @@ impl ClientBuilder {
         self
     }
 
+    #[cfg(all(feature = "native", not(feature = "web")))]
     /// Configure the WebSocket ping/pong interval.
     ///
     /// Default: 30 seconds.
@@ -306,6 +307,7 @@ impl ClientBuilder {
         self
     }
 
+    #[cfg(all(feature = "native", not(feature = "web")))]
     /// Disable WebSocket ping/pongs.
     ///
     /// Default: 30 seconds.
