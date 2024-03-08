@@ -11,24 +11,40 @@ documentation = "https://docs.rs/reconnecting-jsonrpsee-ws-client"
 keywords = ["jsonrpc", "json", "websocket"]
 readme = "README.md"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
-futures = "0.3"
-jsonrpsee = { version = "0.22", features = ["ws-client"] }
-serde_json = { version = "1", features = ["raw_value"] }
-tokio = { version = "1.35", features = ["rt-multi-thread", "sync"] }
-tokio-stream = "0.1"
-tokio-retry = "0.3"
-tracing = "0.1"
+futures = { version = "0.3", default-features = false }
+jsonrpsee = { version = "0.22", default-features = false }
+serde_json = { version = "1", features = ["raw_value"], default-features = false }
+tokio = { version = "1.35", features = ["sync"], default-features = false }
+tokio-stream = { version = "0.1", default-features = false }
+tracing = { version = "0.1", default-features = false }
 thiserror = "1"
+getrandom = { version = "0.2.12", default-features = false }
+again = { git = "https://github.com/softprops/again", branch = "develop", default-features = false }
 
 # optional dependencies
 subxt = { version = "0.34", optional = true }
+wasm-bindgen-futures = { version = "0.4.41", optional = true }
 
 [features]
-default = []
-subxt = ["dep:subxt"]
+default = ["native"]
+native = [
+    "futures/std",
+    "serde_json/std",
+    "tokio/rt-multi-thread",
+    "tracing/std",
+    "jsonrpsee/ws-client",
+    "again/default",
+]
+subxt = ["dep:subxt", "native"]
+web = [
+    "jsonrpsee/jsonrpsee-types",
+    "jsonrpsee/async-wasm-client",
+    "jsonrpsee/client-web-transport",
+    "wasm-bindgen-futures",
+    "again/wasm-bindgen",
+    "getrandom/js",
+]
 
 [dev-dependencies]
 jsonrpsee = { version = "0.22", features = ["server"] }

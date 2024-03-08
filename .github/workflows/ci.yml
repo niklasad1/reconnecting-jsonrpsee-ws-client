@@ -41,7 +41,6 @@ jobs:
         uses: actions-rs/clippy-check@v1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          args: --all-features
 
   check-docs:
     name: Check rustdoc
@@ -58,7 +57,7 @@ jobs:
           override: true
 
       - name: Check rustdoc
-        run: RUSTDOCFLAGS="--cfg docsrs --deny rustdoc::broken_intra_doc_links" cargo doc --verbose --workspace --no-deps --document-private-items --all-features
+        run: RUSTDOCFLAGS="--cfg docsrs --deny rustdoc::broken_intra_doc_links" cargo doc --verbose --workspace --no-deps --document-private-items
 
   check-code:
     name: Check
@@ -89,8 +88,15 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2.7.3
 
-      - name: Cargo check all targets and features
-        run: cargo hack check --workspace --each-feature --all-targets
+      - name: Cargo check all targets and features, except wasm
+        run: |
+          cargo check
+          cargo hack check --workspace --each-feature --exclude-no-default-features --exclude-all-features --exclude-features=web  --all-targets
+
+      - name: Check wasm
+        run: |
+          rustup target add wasm32-unknown-unknown
+          cargo check --no-default-features --features=web --target wasm32-unknown-unknown
 
       - name: Check unused dependencies
         run: cargo machete
