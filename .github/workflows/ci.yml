@@ -124,3 +124,24 @@ jobs:
           command: test
           args: --workspace
 
+  wasm_tests:
+    name: Test wasm
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4.1.1
+
+    - name: Install wasm-pack
+      run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+    - name: Install firefox
+      uses: browser-actions/setup-firefox@latest
+
+    - name: Install chrome
+      uses: browser-actions/setup-chrome@latest
+
+    - name: Run WASM tests
+      run: |
+        wasm-pack test --headless --firefox
+        wasm-pack test --headless --chrome
+      working-directory: wasm-tests
