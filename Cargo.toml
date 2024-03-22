@@ -51,7 +51,7 @@ jsonrpsee = { version = "0.22", features = ["server"] }
 anyhow = "1"
 tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
 subxt = "0.34"
-subxt-signer = "0.34"
+subxt-signer = "0.35"
 
 [[example]]
 name = "hello_subxt"
