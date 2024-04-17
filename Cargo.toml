@@ -13,16 +13,14 @@ readme = "README.md"
 
 [dependencies]
 futures = { version = "0.3", default-features = false }
-jsonrpsee = { version = "0.22.3", default-features = false }
+jsonrpsee = { version = "0.22.4", default-features = false }
 serde_json = { version = "1", features = ["raw_value"], default-features = false }
-tokio = { version = "1.35", features = ["sync"], default-features = false }
+tokio = { version = "1.37", features = ["sync"], default-features = false }
 tokio-stream = { version = "0.1", default-features = false }
 tracing = { version = "0.1", default-features = false }
 thiserror = "1"
-again = { git = "https://github.com/polytope-labs/again", branch = "develop", default-features = false }
+finito = { git = "https://github.com/niklasad1/finito/" }
 
-# optional dependencies
-getrandom = { version = "0.2.12", default-features = false, optional = true }
 subxt = { version = "0.34", optional = true }
 wasm-bindgen-futures = { version = "0.4.41", optional = true }
 
@@ -34,7 +32,6 @@ native = [
     "tokio/rt-multi-thread",
     "tracing/std",
     "jsonrpsee/ws-client",
-    "again/default",
 ]
 subxt = ["dep:subxt", "native"]
 web = [
@@ -42,12 +39,10 @@ web = [
     "jsonrpsee/async-wasm-client",
     "jsonrpsee/client-web-transport",
     "wasm-bindgen-futures",
-    "again/wasm-bindgen",
-    "getrandom/js",
 ]
 
 [dev-dependencies]
-jsonrpsee = { version = "0.22.3", features = ["server"] }
+jsonrpsee = { version = "0.22.4", features = ["server"] }
 hyper = { version = "0.14", features = ["server", "tcp"] }
 anyhow = "1"
 tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
