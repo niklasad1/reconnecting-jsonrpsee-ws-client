@@ -90,7 +90,7 @@ pub use jsonrpsee::{core::client::error::Error as RpcError, rpc_params, types::S
 const LOG_TARGET: &str = "reconnecting_jsonrpsee_ws_client";
 
 /// Method result.
-pub type MethodResult = Result<Box<RawValue>, RpcError>;
+pub type MethodResult = Result<Box<RawValue>, Error>;
 /// Subscription result.
 pub type SubscriptionResult = Result<Box<RawValue>, Disconnect>;
 
@@ -117,14 +117,18 @@ impl ToRpcParams for RpcParams {
 /// may not the case to handle it.
 #[derive(Debug, Copy, Clone)]
 pub enum CallRetryPolicy {
-    /// When the connection is lost the call is re-tried.
-    Retry,
     /// When the connection is lost the call is dropped.
     Drop,
+    /// When the connection is lost the call is re-tried but
+    /// not re-subscribed if the subscription was established.
+    Retry,
+    /// Similar to Retry but also resubscribes the subscriptions that was
+    /// active when the connection was closed.
+    RetryAndResubscribe,
 }
 
 /// An error that indicates the subscription
-/// was disconnnected and will automatically reconnect.
+/// was disconnnected and may reconnect.
 #[derive(Debug, thiserror::Error)]
 pub enum Disconnect {
     /// The connection was closed, reconnect initiated and the subscriptin was re-subscribed to.
@@ -133,6 +137,20 @@ pub enum Disconnect {
     /// The connection was closed, reconnect initated and the subscription was dropped.
     #[error("The client was disconnected `{0}`, reconnect initiated and subscription dropped")]
     Dropped(RpcError),
+}
+
+/// Error that can occur when for a RPC call or subscription.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    /// The client is closed.
+    #[error("The client was disconnected")]
+    Closed,
+    /// The connection was closed and reconnect initiated.
+    #[error("The client connection was closed and reconnect initiated")]
+    DisconnectedWillReconnect,
+    /// Other rpc error.
+    #[error("{0}")]
+    RpcError(RpcError),
 }
 
 /// Represent a single subscription.
@@ -214,7 +232,7 @@ impl Default for ClientBuilder<ExponentialBackoff> {
         Self {
             max_request_size: 10 * 1024 * 1024,
             max_response_size: 10 * 1024 * 1024,
-            retry_policy: ExponentialBackoff::from_millis(10),
+            retry_policy: ExponentialBackoff::from_millis(10).max_delay(Duration::from_secs(60)),
             #[cfg(all(feature = "native", not(feature = "web")))]
             ping_config: Some(PingConfig::new()),
             #[cfg(all(feature = "native", not(feature = "web")))]
@@ -375,8 +393,10 @@ impl Client {
         &self,
         method: String,
         params: P,
-    ) -> Result<Box<RawValue>, RpcError> {
-        let params = params.to_rpc_params()?;
+    ) -> Result<Box<RawValue>, Error> {
+        let params = params
+            .to_rpc_params()
+            .map_err(|e| Error::RpcError(RpcError::ParseError(e)))?;
         self.request_raw(method, params).await
     }
 
@@ -386,8 +406,10 @@ impl Client {
         method: String,
         params: P,
         policy: CallRetryPolicy,
-    ) -> Result<Box<RawValue>, RpcError> {
-        let params = params.to_rpc_params()?;
+    ) -> Result<Box<RawValue>, Error> {
+        let params = params
+            .to_rpc_params()
+            .map_err(|e| Error::RpcError(RpcError::ParseError(e)))?;
         self.request_raw_with_policy(method, params, policy).await
     }
 
@@ -398,7 +420,7 @@ impl Client {
         method: String,
         params: Option<Box<RawValue>>,
         policy: CallRetryPolicy,
-    ) -> Result<Box<RawValue>, RpcError> {
+    ) -> Result<Box<RawValue>, Error> {
         let (tx, rx) = oneshot::channel();
 
         self.tx
@@ -408,9 +430,8 @@ impl Client {
                 send_back: tx,
                 policy,
             })
-            .map_err(|_| RpcError::Custom("Client is dropped".to_string()))?;
-        rx.await
-            .map_err(|_| RpcError::Custom("Client is dropped".to_string()))?
+            .map_err(|_| Error::Closed)?;
+        rx.await.map_err(|_| Error::Closed)?
     }
 
     /// Similar to [`Client::request`] but doesn't check
@@ -419,7 +440,7 @@ impl Client {
         &self,
         method: String,
         params: Option<Box<RawValue>>,
-    ) -> Result<Box<RawValue>, RpcError> {
+    ) -> Result<Box<RawValue>, Error> {
         self.request_raw_with_policy(method, params, CallRetryPolicy::Retry)
             .await
     }
@@ -431,8 +452,10 @@ impl Client {
         params: P,
         unsubscribe_method: String,
         policy: CallRetryPolicy,
-    ) -> Result<Subscription, RpcError> {
-        let params = params.to_rpc_params()?;
+    ) -> Result<Subscription, Error> {
+        let params = params
+            .to_rpc_params()
+            .map_err(|e| Error::RpcError(RpcError::ParseError(e)))?;
         self.subscribe_raw_with_policy(subscribe_method, params, unsubscribe_method, policy)
             .await
     }
@@ -443,8 +466,10 @@ impl Client {
         subscribe_method: String,
         params: P,
         unsubscribe_method: String,
-    ) -> Result<Subscription, RpcError> {
-        let params = params.to_rpc_params()?;
+    ) -> Result<Subscription, Error> {
+        let params = params
+            .to_rpc_params()
+            .map_err(|e| Error::RpcError(RpcError::ParseError(e)))?;
         self.subscribe_raw(subscribe_method, params, unsubscribe_method)
             .await
     }
@@ -456,12 +481,12 @@ impl Client {
         subscribe_method: String,
         params: Option<Box<RawValue>>,
         unsubscribe_method: String,
-    ) -> Result<Subscription, RpcError> {
+    ) -> Result<Subscription, Error> {
         self.subscribe_raw_with_policy(
             subscribe_method,
             params,
             unsubscribe_method,
-            CallRetryPolicy::Retry,
+            CallRetryPolicy::RetryAndResubscribe,
         )
         .await
     }
@@ -474,7 +499,7 @@ impl Client {
         params: Option<Box<RawValue>>,
         unsubscribe_method: String,
         policy: CallRetryPolicy,
-    ) -> Result<Subscription, RpcError> {
+    ) -> Result<Subscription, Error> {
         let (tx, rx) = oneshot::channel();
         self.tx
             .send(Op::Subscription {
@@ -484,20 +509,25 @@ impl Client {
                 send_back: tx,
                 policy,
             })
-            .map_err(|_| RpcError::Custom("Client is dropped".to_string()))?;
-        rx.await
-            .map_err(|_| RpcError::Custom("Client is dropped".to_string()))?
+            .map_err(|_| Error::Closed)?;
+        rx.await.map_err(|_| Error::Closed)?
     }
 
-    /// A future that returns once the client starts to reconnect
-    /// and it doesn't mean that a new connection was established yet.
+    /// A future that returns once the client connetion was closed and
+    /// it started to reconnect.
     ///
     /// This may be called multiple times.
-    pub async fn on_reconnect(&self) {
-        self.reconnect.on_reconnect().await
+    pub async fn reconnect_started(&self) {
+        self.reconnect.reconnect_started().await
     }
 
-    /// Get how many times the client has reconnected.
+    /// A future that returns once the client connection has been re-established.
+    ///
+    /// This may be called multiple times.
+    pub async fn reconnected(&self) {
+        self.reconnect.reconnected().await
+    }
+    /// Get how many times the client has reconnected succesfully.
     pub fn reconnect_count(&self) -> usize {
         self.reconnect.count()
     }
@@ -522,7 +552,7 @@ enum Op {
         subscribe_method: String,
         params: RpcParams,
         unsubscribe_method: String,
-        send_back: oneshot::Sender<Result<Subscription, RpcError>>,
+        send_back: oneshot::Sender<Result<Subscription, Error>>,
         policy: CallRetryPolicy,
     },
 }
@@ -672,9 +702,9 @@ async fn dispatch_call(
                     let _ = send_back.send(Ok(rp));
                     Ok(DispatchedCall::Done)
                 }
-                Err(RpcError::RestartNeeded(e)) => {
+                Err(RpcError::RestartNeeded(_e)) => {
                     if matches!(policy, CallRetryPolicy::Drop) {
-                        let _ = send_back.send(Err(RpcError::RestartNeeded(e)));
+                        let _ = send_back.send(Err(Error::DisconnectedWillReconnect));
                         Err(Closed::Dropped)
                     } else {
                         Err(Closed::Retry {
@@ -690,7 +720,7 @@ async fn dispatch_call(
                 }
                 Err(e) => {
                     // Fails only if the request is dropped.
-                    let _ = send_back.send(Err(e));
+                    let _ = send_back.send(Err(Error::RpcError(e)));
                     Ok(DispatchedCall::Done)
                 }
             }
@@ -743,9 +773,9 @@ async fn dispatch_call(
                     let _ = send_back.send(Ok(stream));
                     Ok(DispatchedCall::Subscription { id, sub })
                 }
-                Err(RpcError::RestartNeeded(e)) => {
+                Err(RpcError::RestartNeeded(_e)) => {
                     if matches!(policy, CallRetryPolicy::Drop) {
-                        let _ = send_back.send(Err(RpcError::RestartNeeded(e)));
+                        let _ = send_back.send(Err(Error::DisconnectedWillReconnect));
                         Err(Closed::Dropped)
                     } else {
                         Err(Closed::Retry {
@@ -762,7 +792,7 @@ async fn dispatch_call(
                 }
                 Err(e) => {
                     // Fails only if the request is dropped.
-                    let _ = send_back.send(Err(e));
+                    let _ = send_back.send(Err(Error::RpcError(e)));
                     Ok(DispatchedCall::Done)
                 }
             }
@@ -785,7 +815,7 @@ async fn subscription_handler(
                 let Some(notif) = next_msg else {
                     let close = client.disconnect_reason().await;
 
-                    let drop = if matches!(policy, CallRetryPolicy::Retry) {
+                    let drop = if matches!(policy, CallRetryPolicy::RetryAndResubscribe) {
                         sub_tx.send(Err(Disconnect::Retry(close))).is_err()
                     } else {
                         let _ = sub_tx.send(Err(Disconnect::Dropped(close)));
@@ -859,20 +889,23 @@ where
         };
     }
 
-    tracing::debug!(target: LOG_TARGET, "Connection to {url} was closed: `{}`", display_close_reason(&close_reason));
+    tracing::debug!(target: LOG_TARGET, "Connection to {url} was closed: `{}`; starting to reconnect", display_close_reason(&close_reason));
+    reconnect.reconnect_initiated();
 
-    reconnect.reconnect();
     let client = Retry::new(retry_policy.clone(), || {
         platform::ws_client(url, client_builder)
     })
     .await?;
+
+    reconnect.reconnected();
+    tracing::debug!(target: LOG_TARGET, "Connection to {url} was succesfully re-established");
 
     for (id, op) in dispatch {
         pending_calls.push(dispatch_call(client.clone(), op, id, sub_tx.clone()).boxed());
     }
 
     for (id, s) in open_subscriptions.iter() {
-        if matches!(s.policy, CallRetryPolicy::Drop) {
+        if !matches!(s.policy, CallRetryPolicy::RetryAndResubscribe) {
             continue;
         }
 
@@ -979,10 +1012,12 @@ mod tests {
             .unwrap();
 
         let _ = handle.send(());
-        client.on_reconnect().await;
+        client.reconnect_started().await;
 
         // Restart the server.
         let (_handle, _) = run_server_with_settings(Some(&addr), false).await.unwrap();
+
+        client.reconnected().await;
 
         // Ensure that the client reconnects and that subscription keep running when
         // the connection is established again.
@@ -1010,7 +1045,7 @@ mod tests {
             .unwrap();
 
         let _ = handle.send(());
-        client.on_reconnect().await;
+        client.reconnect_started().await;
 
         // Restart the server.
         let (_handle, _) = run_server_with_settings(Some(&addr), false).await.unwrap();
@@ -1040,12 +1075,20 @@ mod tests {
             .unwrap();
 
         let _ = handle.send(());
-        client.on_reconnect().await;
+        client.reconnect_started().await;
 
         assert!(matches!(sub.next().await, Some(Ok(_))));
         assert!(matches!(sub.next().await, Some(Err(Disconnect::Retry(_)))));
 
+        // Restart the server.
+        let (_handle, _) = run_server_with_settings(Some(&addr), false).await.unwrap();
+
+        client.reconnected().await;
         assert_eq!(client.reconnect_count(), 1);
+
+        // Ensure that the client reconnects and that subscription keep running when
+        // the connection is established again.
+        assert!(sub.next().await.is_some());
     }
 
     #[tokio::test]
@@ -1067,7 +1110,7 @@ mod tests {
         };
 
         let _ = handle.send(());
-        client.on_reconnect().await;
+        client.reconnect_started().await;
 
         // Restart the server and allow the call to complete.
         let (_handle, _) = run_server_with_settings(Some(&addr), false).await.unwrap();
@@ -1098,12 +1141,15 @@ mod tests {
         };
 
         let _ = handle.send(());
-        client.on_reconnect().await;
+        client.reconnect_started().await;
 
         // Restart the server and allow the call to complete.
         let (_handle, _) = run_server_with_settings(Some(&addr), false).await.unwrap();
 
-        assert!(matches!(req_fut.await, Err(RpcError::RestartNeeded(_))));
+        assert!(matches!(
+            req_fut.await,
+            Err(Error::DisconnectedWillReconnect)
+        ));
     }
 
     #[tokio::test]
@@ -1113,7 +1159,7 @@ mod tests {
         let client = Arc::new(Client::builder().build(addr.clone()).await.unwrap());
 
         let _ = handle.send(());
-        client.on_reconnect().await;
+        client.reconnect_started().await;
 
         let client2 = client.clone();
         let reqs = tokio::spawn(async move {

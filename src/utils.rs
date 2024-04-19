@@ -80,14 +80,17 @@ impl ReconnectCounter {
 
 pub fn reconnect_channel() -> (ReconnectTx, ReconnectRx) {
     let count = ReconnectCounter::new();
-    let notify = Arc::new(Notify::new());
+    let reconn_init = Arc::new(Notify::new());
+    let reconn_compl = Arc::new(Notify::new());
     (
         ReconnectTx {
-            inner: notify.clone(),
+            reconn_init: reconn_init.clone(),
+            reconn_compl: reconn_compl.clone(),
             count: count.clone(),
         },
         ReconnectRx {
-            inner: notify,
+            reconn_init,
+            reconn_compl,
             count,
         },
     )
@@ -95,13 +98,18 @@ pub fn reconnect_channel() -> (ReconnectTx, ReconnectRx) {
 
 #[derive(Debug, Clone)]
 pub struct ReconnectTx {
-    inner: Arc<Notify>,
+    reconn_init: Arc<Notify>,
+    reconn_compl: Arc<Notify>,
     count: ReconnectCounter,
 }
 
 impl ReconnectTx {
-    pub fn reconnect(&self) {
-        self.inner.notify_one();
+    pub fn reconnect_initiated(&self) {
+        self.reconn_init.notify_one();
+    }
+
+    pub fn reconnected(&self) {
+        self.reconn_compl.notify_one();
         self.count.inc();
     }
 
@@ -112,13 +120,18 @@ impl ReconnectTx {
 
 #[derive(Debug, Clone)]
 pub struct ReconnectRx {
-    inner: Arc<Notify>,
+    reconn_init: Arc<Notify>,
+    reconn_compl: Arc<Notify>,
     count: ReconnectCounter,
 }
 
 impl ReconnectRx {
-    pub async fn on_reconnect(&self) {
-        self.inner.notified().await;
+    pub async fn reconnect_started(&self) {
+        self.reconn_init.notified().await;
+    }
+
+    pub async fn reconnected(&self) {
+        self.reconn_compl.notified().await;
     }
 
     pub fn count(&self) -> usize {
