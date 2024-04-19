@@ -3,7 +3,7 @@ name = "reconnecting-jsonrpsee-ws-client"
 authors = ["Niklas Adolfsson <niklasadolfsson1@gmail.com>"]
 version = "0.3.0"
 edition = "2021"
-rust-version = "1.64.0"
+rust-version = "1.70.0"
 license = "MIT"
 repository = "https://github.com/niklasad1/reconnecting-jsonrpsee-ws-client"
 description = "jsonrpc-ws-client that reconnects automatically. Warning: It may lose subscription messages when reconnecting."
@@ -16,12 +16,10 @@ futures = { version = "0.3", default-features = false }
 jsonrpsee = { version = "0.22.4", default-features = false }
 serde_json = { version = "1", features = ["raw_value"], default-features = false }
 tokio = { version = "1.37", features = ["sync"], default-features = false }
-tokio-stream = { version = "0.1", default-features = false }
 tracing = { version = "0.1", default-features = false }
 thiserror = "1"
-finito = { git = "https://github.com/niklasad1/finito/" }
+finito = "0.1"
 
-subxt = { version = "0.34", optional = true }
 wasm-bindgen-futures = { version = "0.4.41", optional = true }
 
 [features]
@@ -33,12 +31,12 @@ native = [
     "tracing/std",
     "jsonrpsee/ws-client",
 ]
-subxt = ["dep:subxt", "native"]
 web = [
     "jsonrpsee/jsonrpsee-types",
     "jsonrpsee/async-wasm-client",
     "jsonrpsee/client-web-transport",
     "wasm-bindgen-futures",
+    "finito/wasm-bindgen"
 ]
 
 [dev-dependencies]
@@ -46,13 +44,6 @@ jsonrpsee = { version = "0.22.4", features = ["server"] }
 hyper = { version = "0.14", features = ["server", "tcp"] }
 anyhow = "1"
 tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
-subxt = "0.34"
-subxt-signer = "0.34"
-
-[[example]]
-name = "hello_subxt"
-path = "examples/hello_subxt.rs"
-required-features = ["subxt"]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -60,6 +51,3 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [package.metadata.playground]
 all-features = true
-
-[package.metadata.cargo-machete]
-ignored = ["getrandom"]
