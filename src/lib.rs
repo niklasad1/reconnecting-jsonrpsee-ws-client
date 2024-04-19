@@ -60,13 +60,11 @@ use finito::Retry;
 use futures::{future::BoxFuture, FutureExt, Stream, StreamExt};
 use jsonrpsee::core::{
     client::{
-        Client as WsClient, ClientT, IdKind, Subscription as RpcSubscription, SubscriptionClientT,
+        Client as WsClient, ClientT, Subscription as RpcSubscription, SubscriptionClientT,
         SubscriptionKind,
     },
     traits::ToRpcParams,
 };
-#[cfg(all(feature = "native", not(feature = "web")))]
-use jsonrpsee::ws_client::HeaderMap;
 use serde_json::value::RawValue;
 use std::{
     collections::HashMap,
@@ -83,9 +81,14 @@ use utils::{reconnect_channel, MaybePendingFutures, ReconnectRx, ReconnectTx};
 
 // re-exports
 pub use finito::{ExponentialBackoff, FibonacciBackoff, FixedInterval};
+pub use jsonrpsee::core::client::IdKind;
+pub use jsonrpsee::{core::client::error::Error as RpcError, rpc_params, types::SubscriptionId};
+
+#[cfg(all(feature = "native", not(feature = "web")))]
+pub use jsonrpsee::ws_client::HeaderMap;
+
 #[cfg(all(feature = "native", not(feature = "web")))]
 pub use jsonrpsee::core::client::async_client::PingConfig;
-pub use jsonrpsee::{core::client::error::Error as RpcError, rpc_params, types::SubscriptionId};
 
 const LOG_TARGET: &str = "reconnecting_jsonrpsee_ws_client";
 
