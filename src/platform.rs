@@ -9,7 +9,7 @@ pub use tokio::spawn;
 pub use wasm_bindgen_futures::spawn_local as spawn;
 
 #[cfg(all(feature = "native", not(feature = "web")))]
-pub async fn ws_client(url: &str, builder: &ClientBuilder) -> Result<Arc<Client>, RpcError> {
+pub async fn ws_client<P>(url: &str, builder: &ClientBuilder<P>) -> Result<Arc<Client>, RpcError> {
     use jsonrpsee::ws_client::WsClientBuilder;
 
     let ClientBuilder {
@@ -49,9 +49,8 @@ pub async fn ws_client(url: &str, builder: &ClientBuilder) -> Result<Arc<Client>
 }
 
 #[cfg(all(feature = "web", target_arch = "wasm32", not(feature = "native")))]
-pub async fn ws_client(url: &str, builder: &ClientBuilder) -> Result<Arc<Client>, RpcError> {
+pub async fn ws_client<P>(url: &str, builder: &ClientBuilder<P>) -> Result<Arc<Client>, RpcError> {
     use jsonrpsee::client_transport::web;
-    use jsonrpsee::core::client::ClientBuilder as RpseeClientBuilder;
 
     let ClientBuilder {
         id_kind,
@@ -65,7 +64,7 @@ pub async fn ws_client(url: &str, builder: &ClientBuilder) -> Result<Arc<Client>
         .await
         .map_err(|e| RpcError::Transport(e.into()))?;
 
-    let ws_client_builder = RpseeClientBuilder::new()
+    let ws_client_builder = jsonrpsee::core::client::ClientBuilder::new()
         .max_buffer_capacity_per_subscription(tokio::sync::Semaphore::MAX_PERMITS)
         .max_concurrent_requests(*max_concurrent_requests as usize)
         .set_max_logging_length(*max_log_len)
