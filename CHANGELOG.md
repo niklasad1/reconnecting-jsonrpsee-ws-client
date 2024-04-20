@@ -4,6 +4,20 @@ The format is based on [Keep a Changelog].
 
 [Keep a Changelog]: http://keepachangelog.com/en/1.0.0/
 
+## [v0.4.0] - 2023-04-20
+
+A new release that makes the library support WASM and two feature flags, `native` and `web` are introduced
+to select whether to compile the library for `native` or `web` but the default is still `native`.
+
+Some other fixes were:
+- Re-export all types in the public API
+- Support other retry strategies for calls and subscriptions.
+- Improve the reconnect API to know when the reconnection started and was completed.
+- Provide an error type.
+- Improve internal feature flag handling.
+
+Thanks to [@seunlanlege](https://github.com/seunlanlege) who did the majority of the work
+to get the library working for WASM.
 
 ## [v0.3.0] - 2023-02-08
 

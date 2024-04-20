@@ -1,55 +1,78 @@
-//! Wrapper crate over the jsonrpsee ws client, which automatically reconnects
-//! under the hood; without that, the user has to restart it manually by
-//! re-transmitting pending calls and re-establish subscriptions that
-//! were closed when the connection was terminated.
+//! # reconnecting-jsonrpsee-ws-client
 //!
-//! The tricky part is subscription, which may lose a few notifications,
-//! then re-connect where it's not possible to know which ones.
+//! Wrapper crate over the jsonrpsee ws client, which automatically reconnects
+//! under the hood; without that, one has to restart it.
+//! It supports a few retry strategies, such as exponential backoff, but it's also possible
+//! to use custom strategies as long as it implements `Iterator<Item = Duration>`.
+//!
+//!
+//! By default, the library is re-transmitting pending calls and re-establishing subscriptions that
+//! were closed until it's successful when the connection was terminated, but it's also possible to disable that
+//! and manage it yourself.
+//!
+//! For instance, you may not want to re-subscribe to a subscription
+//! that has side effects or retries at all. Then the library exposes
+//! `request_with_policy` and `subscribe_with_policy` to support that
+//!
+//! ```no_run
+//! async fn run() {
+//!    use reconnecting_jsonrpsee_ws_client::{Client, CallRetryPolicy, rpc_params};
+//!
+//!    let client = Client::builder().build("ws://127.0.0.1:9944".to_string()).await.unwrap();
+//!    let mut sub = client
+//!        .subscribe_with_policy(
+//!            "subscribe_lo".to_string(),
+//!            rpc_params![],
+//!            "unsubscribe_lo".to_string(),
+//!            // Do not re-subscribe if the connection is closed.
+//!            CallRetryPolicy::Retry,
+//!        )
+//!        .await
+//!        .unwrap();
+//! }
+//! ```
+//!
+//!
+//! The tricky part is subscriptions, which may lose a few notifications
+//! when it's re-connecting, it's not possible to know which ones.
 //!
 //! Lost subscription notifications may be very important to know in some cases,
 //! and then this library is not recommended to use.
 //!
-//! # Examples
 //!
-//! ```rust
-//!    use std::time::Duration;
-//!    use reconnecting_jsonrpsee_ws_client::{Client, ExponentialBackoff, PingConfig, rpc_params};
+//! There is one way to determine how long a reconnection takes:
 //!
-//!    async fn run() {
-//!        // Create a new client with with a reconnecting RPC client.
-//!        let client = Client::builder()
-//!             // Reconnect with exponential backoff.
-//!            .retry_policy(ExponentialBackoff::from_millis(100))
-//!            // Send period WebSocket pings/pongs every 6th second and if it's not ACK:ed in 30 seconds
-//!            // then disconnect.
-//!            //
-//!            // This is just a way to ensure that the connection isn't idle if no message is sent that often
-//!            .enable_ws_ping(
-//!                PingConfig::new()
-//!                .ping_interval(Duration::from_secs(6))
-//!                .inactive_limit(Duration::from_secs(30)),
-//!            )
-//!            // There are other configurations as well that can be found here:
-//!            // <https://docs.rs/reconnecting-jsonrpsee-ws-client/latest/reconnecting_jsonrpsee_ws_client/struct.ClientBuilder.html>
-//!            .build("ws://localhost:9944".to_string())
-//!            .await.unwrap();
+//! ```no_run
+//! async fn run() {
+//!     use reconnecting_jsonrpsee_ws_client::{Client, CallRetryPolicy, rpc_params};
 //!
-//!        // make a JSON-RPC call
-//!        let json = client.request("say_hello".to_string(), rpc_params![]).await.unwrap();
+//!     let client = Client::builder().build("ws://127.0.0.1:9944".to_string()).await.unwrap();
+//!    
+//!     // Print when the RPC client starts to reconnect.
+//!     tokio::spawn(async move {
+//!        loop {
+//!         client.reconnect_started().await;
+//!         let now = std::time::Instant::now();
+//!         client.reconnected().await;
+//!         println!(
+//!            "RPC client reconnection took `{} seconds`",
+//!            now.elapsed().as_secs()
+//!         );
+//!        }
+//!     });
+//! }
 //!
-//!        // make JSON-RPC subscription.
-//!        let mut sub = client.subscribe("subscribe_lo".to_string(), rpc_params![], "unsubscribe_lo".to_string()).await.unwrap();
-//!        let notif = sub.next().await.unwrap();
-//!    }
 //! ```
-#![warn(missing_docs)]
 
-#[cfg(any(
-    all(feature = "web", feature = "native"),
-    not(any(feature = "web", feature = "native"))
-))]
+#![warn(
+    missing_docs,
+    missing_debug_implementations,
+    missing_copy_implementations
+)]
+
+#[cfg(not_supported)]
 compile_error!(
-    "reconnecting-jsonrpsee-client: exactly one of the 'web' and 'native' features should be used."
+    "reconnecting-jsonrpsee-client: exactly one of the 'web' and 'native' features most be used."
 );
 
 mod platform;
@@ -84,11 +107,8 @@ pub use finito::{ExponentialBackoff, FibonacciBackoff, FixedInterval};
 pub use jsonrpsee::core::client::IdKind;
 pub use jsonrpsee::{core::client::error::Error as RpcError, rpc_params, types::SubscriptionId};
 
-#[cfg(all(feature = "native", not(feature = "web")))]
-pub use jsonrpsee::ws_client::HeaderMap;
-
-#[cfg(all(feature = "native", not(feature = "web")))]
-pub use jsonrpsee::core::client::async_client::PingConfig;
+#[cfg(native)]
+pub use jsonrpsee::ws_client::{HeaderMap, PingConfig};
 
 const LOG_TARGET: &str = "reconnecting_jsonrpsee_ws_client";
 
@@ -131,13 +151,13 @@ pub enum CallRetryPolicy {
 }
 
 /// An error that indicates the subscription
-/// was disconnnected and may reconnect.
+/// was disconnected and may reconnect.
 #[derive(Debug, thiserror::Error)]
 pub enum Disconnect {
-    /// The connection was closed, reconnect initiated and the subscriptin was re-subscribed to.
+    /// The connection was closed, reconnect initiated and the subscription was re-subscribed to.
     #[error("The client was disconnected `{0}`, reconnect and re-subscribe initiated")]
     Retry(RpcError),
-    /// The connection was closed, reconnect initated and the subscription was dropped.
+    /// The connection was closed, reconnect initiated and the subscription was dropped.
     #[error("The client was disconnected `{0}`, reconnect initiated and subscription dropped")]
     Dropped(RpcError),
 }
@@ -204,21 +224,21 @@ impl std::fmt::Debug for Subscription {
 
 /// JSON-RPC client that reconnects automatically and may loose
 /// subscription notifications when it reconnects.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Client {
     tx: mpsc::UnboundedSender<Op>,
     reconnect: ReconnectRx,
 }
 
 /// Builder for [`Client`].
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ClientBuilder<P> {
     max_request_size: u32,
     max_response_size: u32,
     retry_policy: P,
-    #[cfg(all(feature = "native", not(feature = "web")))]
+    #[cfg(native)]
     ping_config: Option<PingConfig>,
-    #[cfg(all(feature = "native", not(feature = "web")))]
+    #[cfg(native)]
     // web doesn't support custom headers
     // https://stackoverflow.com/a/4361358/6394734
     headers: HeaderMap,
@@ -236,9 +256,9 @@ impl Default for ClientBuilder<ExponentialBackoff> {
             max_request_size: 10 * 1024 * 1024,
             max_response_size: 10 * 1024 * 1024,
             retry_policy: ExponentialBackoff::from_millis(10).max_delay(Duration::from_secs(60)),
-            #[cfg(all(feature = "native", not(feature = "web")))]
+            #[cfg(native)]
             ping_config: Some(PingConfig::new()),
-            #[cfg(all(feature = "native", not(feature = "web")))]
+            #[cfg(native)]
             headers: HeaderMap::new(),
             max_redirections: 5,
             id_kind: IdKind::Number,
@@ -326,7 +346,8 @@ where
         self
     }
 
-    #[cfg(all(feature = "native", not(feature = "web")))]
+    #[cfg(native)]
+    #[cfg_attr(docsrs, cfg(native))]
     /// Configure custom headers to use in the WebSocket handshake.
     pub fn set_headers(mut self, headers: HeaderMap) -> Self {
         self.headers = headers;
@@ -341,9 +362,9 @@ where
             max_request_size: self.max_request_size,
             max_response_size: self.max_response_size,
             retry_policy,
-            #[cfg(all(feature = "native", not(feature = "web")))]
+            #[cfg(native)]
             ping_config: self.ping_config,
-            #[cfg(all(feature = "native", not(feature = "web")))]
+            #[cfg(native)]
             headers: self.headers,
             max_redirections: self.max_redirections,
             max_log_len: self.max_log_len,
@@ -354,7 +375,8 @@ where
         }
     }
 
-    #[cfg(all(feature = "native", not(feature = "web")))]
+    #[cfg(native)]
+    #[cfg_attr(docsrs, cfg(native))]
     /// Configure the WebSocket ping/pong interval.
     ///
     /// Default: 30 seconds.
@@ -363,7 +385,8 @@ where
         self
     }
 
-    #[cfg(all(feature = "native", not(feature = "web")))]
+    #[cfg(native)]
+    #[cfg_attr(docsrs, cfg(native))]
     /// Disable WebSocket ping/pongs.
     ///
     /// Default: 30 seconds.
@@ -530,7 +553,7 @@ impl Client {
     pub async fn reconnected(&self) {
         self.reconnect.reconnected().await
     }
-    /// Get how many times the client has reconnected succesfully.
+    /// Get how many times the client has reconnected successfully.
     pub fn reconnect_count(&self) -> usize {
         self.reconnect.count()
     }
@@ -631,7 +654,7 @@ async fn background_task<P>(
                         client = match reconnect(params).await {
                             Ok(client) => client,
                             Err(e) => {
-                                tracing::error!(target: LOG_TARGET, "Failed to reconnect/re-establish subscriptions: {e}; terminating the connection");
+                                tracing::debug!(target: LOG_TARGET, "Failed to reconnect: {e}; terminating the connection");
                                 break;
                             }
                         };
@@ -658,7 +681,7 @@ async fn background_task<P>(
                 client = match reconnect(params).await {
                     Ok(client) => client,
                     Err(e) => {
-                        tracing::error!(target: LOG_TARGET, "Failed to reconnect/re-establish subscriptions: {e}; terminating the connection");
+                        tracing::debug!(target: LOG_TARGET, "Failed to reconnect: {e}; terminating the connection");
                         break;
                     }
                 };
@@ -839,7 +862,7 @@ async fn subscription_handler(
              _ = sub_tx.closed() => {
                 break true
             }
-            // This channel indices wheter the main task has been closed.
+            // This channel indices whether the main task has been closed.
             // at this point no further messages are processed.
             _ = remove_sub.closed() => {
                 break true
@@ -901,7 +924,7 @@ where
     .await?;
 
     reconnect.reconnected();
-    tracing::debug!(target: LOG_TARGET, "Connection to {url} was succesfully re-established");
+    tracing::debug!(target: LOG_TARGET, "Connection to {url} was successfully re-established");
 
     for (id, op) in dispatch {
         pending_calls.push(dispatch_call(client.clone(), op, id, sub_tx.clone()).boxed());
@@ -1172,7 +1195,7 @@ mod tests {
 
             futs.try_for_each(|_| future::ready(Ok(())))
                 .await
-                .expect("Requests should be succesful");
+                .expect("Requests should be successful");
         });
 
         // Restart the server and allow the call to complete.
@@ -1181,6 +1204,26 @@ mod tests {
         reqs.await.unwrap();
 
         assert_eq!(client.reconnect_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn gives_up_after_ten_retries() {
+        init_logger();
+
+        let (handle, addr) = run_server_with_settings(None, true).await.unwrap();
+        let client = Client::builder()
+            .retry_policy(FixedInterval::from_millis(10).take(10))
+            .build(addr.clone())
+            .await
+            .unwrap();
+
+        let _ = handle.send(());
+        client.reconnect_started().await;
+
+        assert!(matches!(
+            client.request("say_hello".to_string(), rpc_params![]).await,
+            Err(Error::Closed)
+        ));
     }
 
     async fn run_server() -> anyhow::Result<(tokio::sync::broadcast::Sender<()>, String)> {

@@ -2,13 +2,13 @@ use crate::{ClientBuilder, RpcError};
 use jsonrpsee::core::client::Client;
 use std::sync::Arc;
 
-#[cfg(all(feature = "native", not(feature = "web")))]
+#[cfg(native)]
 pub use tokio::spawn;
 
-#[cfg(all(feature = "web", target_arch = "wasm32", not(feature = "native")))]
+#[cfg(web)]
 pub use wasm_bindgen_futures::spawn_local as spawn;
 
-#[cfg(all(feature = "native", not(feature = "web")))]
+#[cfg(native)]
 pub async fn ws_client<P>(url: &str, builder: &ClientBuilder<P>) -> Result<Arc<Client>, RpcError> {
     use jsonrpsee::ws_client::WsClientBuilder;
 
@@ -48,9 +48,9 @@ pub async fn ws_client<P>(url: &str, builder: &ClientBuilder<P>) -> Result<Arc<C
     Ok(Arc::new(client))
 }
 
-#[cfg(all(feature = "web", target_arch = "wasm32", not(feature = "native")))]
+#[cfg(web)]
 pub async fn ws_client<P>(url: &str, builder: &ClientBuilder<P>) -> Result<Arc<Client>, RpcError> {
-    use jsonrpsee::client_transport::web;
+    use jsonrpsee::wasm_client::WasmClientBuilder;
 
     let ClientBuilder {
         id_kind,
@@ -60,19 +60,14 @@ pub async fn ws_client<P>(url: &str, builder: &ClientBuilder<P>) -> Result<Arc<C
         ..
     } = builder;
 
-    let (tx, rx) = web::connect(url)
-        .await
-        .map_err(|e| RpcError::Transport(e.into()))?;
-
-    let ws_client_builder = jsonrpsee::core::client::ClientBuilder::new()
+    let ws_client_builder = WasmClientBuilder::new()
         .max_buffer_capacity_per_subscription(tokio::sync::Semaphore::MAX_PERMITS)
         .max_concurrent_requests(*max_concurrent_requests as usize)
         .set_max_logging_length(*max_log_len)
-        .set_tcp_no_delay(true)
         .request_timeout(*request_timeout)
         .id_format(*id_kind);
 
-    let client = ws_client_builder.build_with_wasm(tx, rx);
+    let client = ws_client_builder.build(url).await?;
 
     Ok(Arc::new(client))
 }
