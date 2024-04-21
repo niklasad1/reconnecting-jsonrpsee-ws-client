@@ -4,6 +4,11 @@ The format is based on [Keep a Changelog].
 
 [Keep a Changelog]: http://keepachangelog.com/en/1.0.0/
 
+## [v0.4.1] - 2023-04-21
+
+This ia a small-patch release that enables the feature flag `doc_cfg` to 
+render feature-gated APIs properly on the documentation website.
+
 ## [v0.4.0] - 2023-04-20
 
 A new release that makes the library support WASM and two feature flags, `native` and `web` are introduced
