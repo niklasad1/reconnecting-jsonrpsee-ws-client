@@ -69,6 +69,7 @@
     missing_debug_implementations,
     missing_copy_implementations
 )]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 #[cfg(not_supported)]
 compile_error!(
