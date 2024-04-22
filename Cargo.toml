@@ -41,7 +41,7 @@ web = [
 
 [dev-dependencies]
 jsonrpsee = { version = "0.22.4", features = ["server"] }
-hyper = { version = "0.14", features = ["server", "tcp"] }
+hyper = { version = "1.3", features = ["server", "tcp"] }
 anyhow = "1"
 tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
 
