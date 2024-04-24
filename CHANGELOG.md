@@ -4,6 +4,11 @@ The format is based on [Keep a Changelog].
 
 [Keep a Changelog]: http://keepachangelog.com/en/1.0.0/
 
+## [v0.4.2] - 2023-04-24
+
+Another release to enable `#[cfg_attr(docsrs, doc(cfg(native)))]` to hopefully
+render feature-gated APIs properly on the documentation website.
+
 ## [v0.4.1] - 2023-04-21
 
 This ia a small-patch release that enables the feature flag `doc_cfg` to 

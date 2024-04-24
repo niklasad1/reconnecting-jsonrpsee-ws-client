@@ -1,7 +1,7 @@
 [package]
 name = "reconnecting-jsonrpsee-ws-client"
 authors = ["Niklas Adolfsson <niklasadolfsson1@gmail.com>"]
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 rust-version = "1.70.0"
 license = "MIT"
@@ -33,11 +33,7 @@ native = [
     "tracing/std",
     "jsonrpsee/ws-client",
 ]
-web = [
-    "jsonrpsee/wasm-client",
-    "wasm-bindgen-futures",
-    "finito/wasm-bindgen"
-]
+web = ["jsonrpsee/wasm-client", "wasm-bindgen-futures", "finito/wasm-bindgen"]
 
 [dev-dependencies]
 jsonrpsee = { version = "0.22.4", features = ["server"] }
