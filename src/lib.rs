@@ -348,7 +348,7 @@ where
     }
 
     #[cfg(native)]
-    #[cfg_attr(docsrs, cfg(native))]
+    #[cfg_attr(docsrs, doc(cfg(native)))]
     /// Configure custom headers to use in the WebSocket handshake.
     pub fn set_headers(mut self, headers: HeaderMap) -> Self {
         self.headers = headers;
@@ -377,7 +377,7 @@ where
     }
 
     #[cfg(native)]
-    #[cfg_attr(docsrs, cfg(native))]
+    #[cfg_attr(docsrs, doc(cfg(native)))]
     /// Configure the WebSocket ping/pong interval.
     ///
     /// Default: 30 seconds.
@@ -387,7 +387,7 @@ where
     }
 
     #[cfg(native)]
-    #[cfg_attr(docsrs, cfg(native))]
+    #[cfg_attr(docsrs, doc(cfg(native)))]
     /// Disable WebSocket ping/pongs.
     ///
     /// Default: 30 seconds.

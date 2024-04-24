@@ -16,7 +16,7 @@ that has side effects or retries at all. Then the library exposes
 `request_with_policy` and `subscribe_with_policy` to support that
 
 
-```text
+```rust
     let mut sub = client
         .subscribe_with_policy(
             "subscribe_lo".to_string(),
@@ -40,7 +40,7 @@ and then this library is not recommended to use.
 
 There is one way to determine how long a reconnection takes:
 
-```text
+```rust
     // Print when the RPC client starts to reconnect.
     loop {
         rpc.reconnect_started().await;
