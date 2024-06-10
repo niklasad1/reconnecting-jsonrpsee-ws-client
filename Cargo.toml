@@ -13,7 +13,7 @@ readme = "README.md"
 
 [dependencies]
 futures = { version = "0.3", default-features = false }
-jsonrpsee = { version = "0.22.4" }
+jsonrpsee = { version = "0.23.0" }
 serde_json = { version = "1", features = ["raw_value"], default-features = false }
 tokio = { version = "1.37", features = ["sync"], default-features = false }
 tracing = { version = "0.1", default-features = false }
@@ -36,7 +36,7 @@ native = [
 web = ["jsonrpsee/wasm-client", "wasm-bindgen-futures", "finito/wasm-bindgen"]
 
 [dev-dependencies]
-jsonrpsee = { version = "0.22.4", features = ["server"] }
+jsonrpsee = { version = "0.23.0", features = ["server"] }
 hyper = { version = "0.14", features = ["server", "tcp"] }
 anyhow = "1"
 tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
