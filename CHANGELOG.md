@@ -4,6 +4,10 @@ The format is based on [Keep a Changelog].
 
 [Keep a Changelog]: http://keepachangelog.com/en/1.0.0/
 
+## [v0.4.3] - 2023-06-25
+
+This is non-breaking release that bumps the `jsonrpsee` dependency to `0.23.0`.
+
 ## [v0.4.2] - 2023-04-24
 
 Another release to enable `#[cfg_attr(docsrs, doc(cfg(native)))]` to hopefully
