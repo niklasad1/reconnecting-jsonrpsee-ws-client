@@ -21,7 +21,7 @@ tracing = { version = "0.1", default-features = false }
 # WASM
 wasm-bindgen-futures = { version = "0.4.41", optional = true }
 
-thiserror = "1"
+thiserror = "2"
 finito = "0.1"
 
 [features]
