@@ -4,6 +4,10 @@ The format is based on [Keep a Changelog].
 
 [Keep a Changelog]: http://keepachangelog.com/en/1.0.0/
 
+## [v0.4.4] - 2025-04-14
+
+This release bumps the `jsonrpsee` dependency to `0.24.6` which requires MSRV 1.74.1
+
 ## [v0.4.3] - 2023-06-25
 
 This is non-breaking release that bumps the `jsonrpsee` dependency to `0.23.0`.
