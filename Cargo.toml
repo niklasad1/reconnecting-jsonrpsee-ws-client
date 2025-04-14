@@ -3,7 +3,7 @@ name = "reconnecting-jsonrpsee-ws-client"
 authors = ["Niklas Adolfsson <niklasadolfsson1@gmail.com>"]
 version = "0.4.4"
 edition = "2021"
-rust-version = "1.74.1"
+rust-version = "1.81.0"
 license = "MIT"
 repository = "https://github.com/niklasad1/reconnecting-jsonrpsee-ws-client"
 description = "jsonrpc-ws-client that reconnects automatically. Warning: It may lose subscription messages when reconnecting."
@@ -13,9 +13,9 @@ readme = "README.md"
 
 [dependencies]
 futures = { version = "0.3", default-features = false }
-jsonrpsee = { version = "0.24.6" }
+jsonrpsee = { version = "0.24.9" }
 serde_json = { version = "1", features = ["raw_value"], default-features = false }
-tokio = { version = "1.37", features = ["sync"], default-features = false }
+tokio = { version = "1.44.2", features = ["sync"], default-features = false }
 tracing = { version = "0.1", default-features = false }
 
 # WASM
