@@ -4,9 +4,17 @@ The format is based on [Keep a Changelog].
 
 [Keep a Changelog]: http://keepachangelog.com/en/1.0.0/
 
-## [v0.4.4] - 2025-04-14
+## [v0.5.0] - 2025-04-14
 
-This release bumps the `jsonrpsee` dependency to `0.24.6` which requires MSRV 1.74.1
+This is a breaking release that changes to the following:
+- bump dependency jsonrpsee to `v0.24.9`
+- bump dependency thiserror `v2.0.0`
+- bump dependency tokio to `v1.44.2` (soundness issue)
+- update MSRV to 1.81.0
+
+## [v0.4.4] - 2025-04-14 [YANKED]
+
+Yanked because it was a breaking change to bump thiserror to v2.0.0
 
 ## [v0.4.3] - 2023-06-25
 
