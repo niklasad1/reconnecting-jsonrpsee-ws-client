@@ -13,7 +13,7 @@ readme = "README.md"
 
 [dependencies]
 futures = { version = "0.3", default-features = false }
-jsonrpsee = { version = "0.24.9" }
+jsonrpsee = { version = "0.26.0" }
 serde_json = { version = "1", features = ["raw_value"], default-features = false }
 tokio = { version = "1.44.2", features = ["sync"], default-features = false }
 tracing = { version = "0.1", default-features = false }
