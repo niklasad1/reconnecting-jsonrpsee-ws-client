@@ -7,7 +7,7 @@ The format is based on [Keep a Changelog].
 ## [v0.6.0] - 2025-09-22
 
 This is a breaking release that changes:
- - update `jsonrpsee` dependency from 0.24 to 0.26.
+ - update `jsonrpsee` from 0.24 to 0.26.
  - update MSRV to 1.85.1.
 
 ## [v0.5.0] - 2025-04-14
