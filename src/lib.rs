@@ -649,7 +649,7 @@ async fn background_task<P>(
                             sub_tx: sub_tx.clone(),
                             open_subscriptions: &open_subscriptions,
                             client_builder: &client_builder,
-                            close_reason: client.disconnect_reason().await,
+                            close_reason: client.on_disconnect().await,
                         };
 
                         client = match reconnect(params).await {
@@ -676,7 +676,7 @@ async fn background_task<P>(
                     sub_tx: sub_tx.clone(),
                     open_subscriptions: &open_subscriptions,
                     client_builder: &client_builder,
-                    close_reason: client.disconnect_reason().await,
+                    close_reason: client.on_disconnect().await,
                 };
 
                 client = match reconnect(params).await {
@@ -840,7 +840,7 @@ async fn subscription_handler(
         tokio::select! {
             next_msg = rpc_sub.next() => {
                 let Some(notif) = next_msg else {
-                    let close = client.disconnect_reason().await;
+                    let close = client.on_disconnect().await;
 
                     let drop = if matches!(policy, CallRetryPolicy::RetryAndResubscribe) {
                         sub_tx.send(Err(Disconnect::Retry(close))).is_err()
@@ -967,8 +967,8 @@ mod tests {
         TryStreamExt,
     };
     use jsonrpsee_server::{
-        http, stop_channel, ws, ConnectionGuard, ConnectionState, HttpRequest, HttpResponse,
-        RpcModule, RpcServiceBuilder, ServerConfig, SubscriptionMessage,
+        http, middleware::rpc::RpcServiceBuilder, stop_channel, ws, ConnectionGuard,
+        ConnectionState, HttpRequest, HttpResponse, RpcModule, ServerConfig, SubscriptionMessage,
     };
     use tower::BoxError;
     use tracing_subscriber::util::SubscriberInitExt;
@@ -1269,10 +1269,11 @@ mod tests {
             |_params, pending, _ctx, _| async move {
                 let sink = pending.accept().await.unwrap();
                 let i = 0;
+                let json = serde_json::value::to_raw_value(&i).unwrap();
 
                 loop {
                     if sink
-                        .send(SubscriptionMessage::from_json(&i).unwrap())
+                        .send(SubscriptionMessage::from(json.clone()))
                         .await
                         .is_err()
                     {
